@@ -229,9 +229,10 @@ pub const DeclGen = struct {
 
     /// Fetch the result-id for a previously generated instruction or constant.
     fn resolve(self: *DeclGen, inst: Air.Inst.Ref) !IdRef {
+        const mod = self.module;
         if (self.air.value(inst)) |val| {
             const ty = self.air.typeOf(inst);
-            if (ty.zigTypeTag() == .Fn) {
+            if (ty.zigTypeTag(mod) == .Fn) {
                 const fn_decl_index = switch (val.tag()) {
                     .extern_fn => val.castTag(.extern_fn).?.data.owner_decl,
                     .function => val.castTag(.function).?.data.owner_decl,
@@ -337,8 +338,9 @@ pub const DeclGen = struct {
     }
 
     fn arithmeticTypeInfo(self: *DeclGen, ty: Type) !ArithmeticTypeInfo {
+        const mod = self.module;
         const target = self.getTarget();
-        return switch (ty.zigTypeTag()) {
+        return switch (ty.zigTypeTag(mod)) {
             .Bool => ArithmeticTypeInfo{
                 .bits = 1, // Doesn't matter for this class.
                 .is_vector = false,
@@ -352,7 +354,7 @@ pub const DeclGen = struct {
                 .class = .float,
             },
             .Int => blk: {
-                const int_info = ty.intInfo(target);
+                const int_info = ty.intInfo(mod);
                 // TODO: Maybe it's useful to also return this value.
                 const maybe_backing_bits = self.backingIntBits(int_info.bits);
                 break :blk ArithmeticTypeInfo{
@@ -523,15 +525,15 @@ pub const DeclGen = struct {
         }
 
         fn addInt(self: *@This(), ty: Type, val: Value) !void {
-            const target = self.dg.getTarget();
-            const int_info = ty.intInfo(target);
+            const mod = self.dg.module;
+            const int_info = ty.intInfo(mod);
             const int_bits = switch (int_info.signedness) {
-                .signed => @bitCast(u64, val.toSignedInt(target)),
-                .unsigned => val.toUnsignedInt(target),
+                .signed => @bitCast(u64, val.toSignedInt(mod)),
+                .unsigned => val.toUnsignedInt(mod),
             };
 
             // TODO: Swap endianess if the compiler is big endian.
-            const len = ty.abiSize(target);
+            const len = ty.abiSize(mod);
             try self.addBytes(std.mem.asBytes(&int_bits)[0..@intCast(usize, len)]);
         }
 
@@ -576,13 +578,14 @@ pub const DeclGen = struct {
         fn lower(self: *@This(), ty: Type, val: Value) !void {
             const target = self.dg.getTarget();
             const dg = self.dg;
+            const mod = dg.module;
 
             if (val.isUndef()) {
-                const size = ty.abiSize(target);
+                const size = ty.abiSize(mod);
                 return try self.addUndef(size);
             }
 
-            switch (ty.zigTypeTag()) {
+            switch (ty.zigTypeTag(mod)) {
                 .Int => try self.addInt(ty, val),
                 .Bool => try self.addConstBool(val.toBool()),
                 .Array => switch (val.tag()) {
@@ -610,7 +613,7 @@ pub const DeclGen = struct {
                         const bytes = dg.module.string_literal_bytes.items[str_lit.index..][0..str_lit.len];
                         try self.addBytes(bytes);
                         if (ty.sentinel()) |sentinel| {
-                            try self.addByte(@intCast(u8, sentinel.toUnsignedInt(target)));
+                            try self.addByte(@intCast(u8, sentinel.toUnsignedInt(mod)));
                         }
                     },
                     .bytes => {
@@ -668,7 +671,7 @@ pub const DeclGen = struct {
                     var opt_buf: Type.Payload.ElemType = undefined;
                     const payload_ty = ty.optionalChild(&opt_buf);
                     const has_payload = !val.isNull();
-                    const abi_size = ty.abiSize(target);
+                    const abi_size = ty.abiSize(mod);
 
                     if (!payload_ty.hasRuntimeBits()) {
                         try self.addConstBool(has_payload);
@@ -691,7 +694,7 @@ pub const DeclGen = struct {
 
                     // Subtract 1 for @sizeOf(bool).
                     // TODO: Make this not hardcoded.
-                    const payload_size = payload_ty.abiSize(target);
+                    const payload_size = payload_ty.abiSize(mod);
                     const padding = abi_size - payload_size - 1;
 
                     if (val.castTag(.opt_payload)) |payload| {
@@ -706,8 +709,7 @@ pub const DeclGen = struct {
                     var int_val_buffer: Value.Payload.U64 = undefined;
                     const int_val = val.enumToInt(ty, &int_val_buffer);
 
-                    var int_ty_buffer: Type.Payload.Bits = undefined;
-                    const int_ty = ty.intTagType(&int_ty_buffer);
+                    const int_ty = ty.intTagType();
 
                     try self.lower(int_ty, int_val);
                 },
@@ -734,9 +736,9 @@ pub const DeclGen = struct {
                         try self.lower(ty.unionTagTypeSafety().?, tag_and_val.tag);
                     }
 
-                    const active_field_size = if (active_field_ty.hasRuntimeBitsIgnoreComptime()) blk: {
+                    const active_field_size = if (active_field_ty.hasRuntimeBitsIgnoreComptime(mod)) blk: {
                         try self.lower(active_field_ty, tag_and_val.val);
-                        break :blk active_field_ty.abiSize(target);
+                        break :blk active_field_ty.abiSize(mod);
                     } else 0;
 
                     const payload_padding_len = layout.payload_size - active_field_size;
@@ -765,16 +767,16 @@ pub const DeclGen = struct {
                     const is_pl = val.errorUnionIsPayload();
                     const error_val = if (!is_pl) val else Value.initTag(.zero);
 
-                    if (!payload_ty.hasRuntimeBitsIgnoreComptime()) {
+                    if (!payload_ty.hasRuntimeBitsIgnoreComptime(mod)) {
                         return try self.lower(Type.anyerror, error_val);
                     }
 
-                    const payload_align = payload_ty.abiAlignment(target);
-                    const error_align = Type.anyerror.abiAlignment(target);
+                    const payload_align = payload_ty.abiAlignment(mod);
+                    const error_align = Type.anyerror.abiAlignment(mod);
 
-                    const payload_size = payload_ty.abiSize(target);
-                    const error_size = Type.anyerror.abiAlignment(target);
-                    const ty_size = ty.abiSize(target);
+                    const payload_size = payload_ty.abiSize(mod);
+                    const error_size = Type.anyerror.abiAlignment(mod);
+                    const ty_size = ty.abiSize(mod);
                     const padding = ty_size - payload_size - error_size;
 
                     const payload_val = if (val.castTag(.eu_payload)) |pl| pl.data else Value.initTag(.undef);
@@ -850,7 +852,7 @@ pub const DeclGen = struct {
         //         .id_result = result_id,
         //         .storage_class = storage_class,
         //     });
-        // } else if (ty.abiSize(target) == 0) {
+        // } else if (ty.abiSize(mod) == 0) {
         //     // Special case: if the type has no size, then return an undefined pointer.
         //     return try section.emit(self.spv.gpa, .OpUndef, .{
         //         .id_result_type = self.typeId(ptr_ty_ref),
@@ -932,7 +934,7 @@ pub const DeclGen = struct {
     /// is then loaded using OpLoad. Such values are loaded into the UniformConstant storage class by default.
     /// This function should only be called during function code generation.
     fn constant(self: *DeclGen, ty: Type, val: Value) !IdRef {
-        const target = self.getTarget();
+        const mod = self.module;
         const section = &self.spv.sections.types_globals_constants;
         const result_ty_ref = try self.resolveType(ty, .direct);
         const result_ty_id = self.typeId(result_ty_ref);
@@ -946,12 +948,12 @@ pub const DeclGen = struct {
             return result_id;
         }
 
-        switch (ty.zigTypeTag()) {
+        switch (ty.zigTypeTag(mod)) {
             .Int => {
                 const int_bits = if (ty.isSignedInt())
-                    @bitCast(u64, val.toSignedInt(target))
+                    @bitCast(u64, val.toSignedInt(mod))
                 else
-                    val.toUnsignedInt(target);
+                    val.toUnsignedInt(mod);
                 try self.genConstInt(result_ty_ref, result_id, int_bits);
             },
             .Bool => {
@@ -967,7 +969,7 @@ pub const DeclGen = struct {
             else => {
                 // The value cannot be generated directly, so generate it as an indirect constant,
                 // and then perform an OpLoad.
-                const alignment = ty.abiAlignment(target);
+                const alignment = ty.abiAlignment(mod);
                 const spv_decl_index = try self.spv.allocDecl(.global);
 
                 try self.lowerIndirectConstant(
@@ -1042,6 +1044,7 @@ pub const DeclGen = struct {
     /// NOTE: When the active field is set to something other than the most aligned field, the
     ///   resulting struct will be *underaligned*.
     fn resolveUnionType(self: *DeclGen, ty: Type, maybe_active_field: ?usize) !SpvType.Ref {
+        const mod = self.module;
         const target = self.getTarget();
         const layout = ty.unionGetLayout(target);
         const union_ty = ty.cast(Type.Payload.Union).?.data;
@@ -1070,10 +1073,10 @@ pub const DeclGen = struct {
         const active_field = maybe_active_field orelse layout.most_aligned_field;
         const active_field_ty = union_ty.fields.values()[active_field].ty;
 
-        const active_field_size = if (active_field_ty.hasRuntimeBitsIgnoreComptime()) blk: {
+        const active_field_size = if (active_field_ty.hasRuntimeBitsIgnoreComptime(mod)) blk: {
             const active_payload_ty_ref = try self.resolveType(active_field_ty, .indirect);
             members.appendAssumeCapacity(.{ .name = "payload", .ty = active_payload_ty_ref });
-            break :blk active_field_ty.abiSize(target);
+            break :blk active_field_ty.abiSize(mod);
         } else 0;
 
         const payload_padding_len = layout.payload_size - active_field_size;
@@ -1096,9 +1099,10 @@ pub const DeclGen = struct {
 
     /// Turn a Zig type into a SPIR-V Type, and return a reference to it.
     fn resolveType(self: *DeclGen, ty: Type, repr: Repr) Error!SpvType.Ref {
+        const mod = self.module;
         log.debug("resolveType: ty = {}", .{ty.fmt(self.module)});
         const target = self.getTarget();
-        switch (ty.zigTypeTag()) {
+        switch (ty.zigTypeTag(mod)) {
             .Void, .NoReturn => return try self.spv.resolveType(SpvType.initTag(.void)),
             .Bool => switch (repr) {
                 .direct => return try self.spv.resolveType(SpvType.initTag(.bool)),
@@ -1108,12 +1112,11 @@ pub const DeclGen = struct {
                 .indirect => return try self.intType(.unsigned, 1),
             },
             .Int => {
-                const int_info = ty.intInfo(target);
+                const int_info = ty.intInfo(mod);
                 return try self.intType(int_info.signedness, int_info.bits);
             },
             .Enum => {
-                var buffer: Type.Payload.Bits = undefined;
-                const tag_ty = ty.intTagType(&buffer);
+                const tag_ty = ty.intTagType();
                 return self.resolveType(tag_ty, repr);
             },
             .Float => {
@@ -1207,7 +1210,7 @@ pub const DeclGen = struct {
                     var member_index: u32 = 0;
                     for (tuple.types, 0..) |field_ty, i| {
                         const field_val = tuple.values[i];
-                        if (field_val.tag() != .unreachable_value or !field_ty.hasRuntimeBitsIgnoreComptime()) continue;
+                        if (field_val.tag() != .unreachable_value or !field_ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
                         members[member_index] = .{
                             .ty = try self.resolveType(field_ty, .indirect),
                         };
@@ -1251,7 +1254,7 @@ pub const DeclGen = struct {
             .Optional => {
                 var buf: Type.Payload.ElemType = undefined;
                 const payload_ty = ty.optionalChild(&buf);
-                if (!payload_ty.hasRuntimeBitsIgnoreComptime()) {
+                if (!payload_ty.hasRuntimeBitsIgnoreComptime(mod)) {
                     // Just use a bool.
                     // Note: Always generate the bool with indirect format, to save on some sanity
                     // Perform the converison to a direct bool when the field is extracted.
@@ -1277,14 +1280,14 @@ pub const DeclGen = struct {
             .ErrorUnion => {
                 const payload_ty = ty.errorUnionPayload();
                 const error_ty_ref = try self.resolveType(Type.anyerror, .indirect);
-                if (!payload_ty.hasRuntimeBitsIgnoreComptime()) {
+                if (!payload_ty.hasRuntimeBitsIgnoreComptime(mod)) {
                     return error_ty_ref;
                 }
 
                 const payload_ty_ref = try self.resolveType(payload_ty, .indirect);
 
-                const payload_align = payload_ty.abiAlignment(target);
-                const error_align = Type.anyerror.abiAlignment(target);
+                const payload_align = payload_ty.abiAlignment(mod);
+                const error_align = Type.anyerror.abiAlignment(mod);
 
                 var members = std.BoundedArray(SpvType.Payload.Struct.Member, 2){};
                 // Similar to unions, we're going to put the most aligned member first.
@@ -1412,14 +1415,15 @@ pub const DeclGen = struct {
     }
 
     fn genDecl(self: *DeclGen) !void {
-        const decl = self.module.declPtr(self.decl_index);
+        const mod = self.module;
+        const decl = mod.declPtr(self.decl_index);
         const spv_decl_index = try self.resolveDecl(self.decl_index);
 
         const decl_id = self.spv.declPtr(spv_decl_index).result_id;
         log.debug("genDecl {s} = {}", .{ decl.name, decl_id });
 
         if (decl.val.castTag(.function)) |_| {
-            assert(decl.ty.zigTypeTag() == .Fn);
+            assert(decl.ty.zigTypeTag(mod) == .Fn);
             const prototype_id = try self.resolveTypeId(decl.ty);
             try self.func.prologue.emit(self.spv.gpa, .OpFunction, .{
                 .id_result_type = try self.resolveTypeId(decl.ty.fnReturnType()),
@@ -1810,6 +1814,7 @@ pub const DeclGen = struct {
     }
 
     fn airShuffle(self: *DeclGen, inst: Air.Inst.Index) !?IdRef {
+        const mod = self.module;
         if (self.liveness.isUnused(inst)) return null;
         const ty = self.air.typeOfIndex(inst);
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
@@ -1837,7 +1842,7 @@ pub const DeclGen = struct {
             if (elem.isUndef()) {
                 self.func.body.writeOperand(spec.LiteralInteger, 0xFFFF_FFFF);
             } else {
-                const int = elem.toSignedInt(self.getTarget());
+                const int = elem.toSignedInt(mod);
                 const unsigned = if (int >= 0) @intCast(u32, int) else @intCast(u32, ~int + a_len);
                 self.func.body.writeOperand(spec.LiteralInteger, unsigned);
             }
@@ -2046,13 +2051,14 @@ pub const DeclGen = struct {
     fn airPtrElemPtr(self: *DeclGen, inst: Air.Inst.Index) !?IdRef {
         if (self.liveness.isUnused(inst)) return null;
 
+        const mod = self.module;
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const ptr_ty = self.air.typeOf(bin_op.lhs);
         const result_ty = self.air.typeOfIndex(inst);
         const elem_ty = ptr_ty.childType();
         // TODO: Make this return a null ptr or something
-        if (!elem_ty.hasRuntimeBitsIgnoreComptime()) return null;
+        if (!elem_ty.hasRuntimeBitsIgnoreComptime(mod)) return null;
 
         const result_type_id = try self.resolveTypeId(result_ty);
         const base_ptr = try self.resolve(bin_op.lhs);
@@ -2072,6 +2078,7 @@ pub const DeclGen = struct {
     fn airStructFieldVal(self: *DeclGen, inst: Air.Inst.Index) !?IdRef {
         if (self.liveness.isUnused(inst)) return null;
 
+        const mod = self.module;
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const struct_field = self.air.extraData(Air.StructField, ty_pl.payload).data;
 
@@ -2081,9 +2088,9 @@ pub const DeclGen = struct {
         const field_ty = struct_ty.structFieldType(field_index);
         const field_ty_id = try self.resolveTypeId(field_ty);
 
-        if (!field_ty.hasRuntimeBitsIgnoreComptime()) return null;
+        if (!field_ty.hasRuntimeBitsIgnoreComptime(mod)) return null;
 
-        assert(struct_ty.zigTypeTag() == .Struct); // Cannot do unions yet.
+        assert(struct_ty.zigTypeTag(mod) == .Struct); // Cannot do unions yet.
 
         const result_id = self.spv.allocId();
         const indexes = [_]u32{field_index};
@@ -2103,8 +2110,9 @@ pub const DeclGen = struct {
         object_ptr: IdRef,
         field_index: u32,
     ) !?IdRef {
+        const mod = self.module;
         const object_ty = object_ptr_ty.childType();
-        switch (object_ty.zigTypeTag()) {
+        switch (object_ty.zigTypeTag(mod)) {
             .Struct => switch (object_ty.containerLayout()) {
                 .Packed => unreachable, // TODO
                 else => {
@@ -2237,6 +2245,7 @@ pub const DeclGen = struct {
         // the current block by first generating the code of the block, then a label, and then generate the rest of the current
         // ir.Block in a different SPIR-V block.
 
+        const mod = self.module;
         const label_id = self.spv.allocId();
 
         // 4 chosen as arbitrary initial capacity.
@@ -2260,7 +2269,7 @@ pub const DeclGen = struct {
         try self.beginSpvBlock(label_id);
 
         // If this block didn't produce a value, simply return here.
-        if (!ty.hasRuntimeBitsIgnoreComptime())
+        if (!ty.hasRuntimeBitsIgnoreComptime(mod))
             return null;
 
         // Combine the result from the blocks using the Phi instruction.
@@ -2286,7 +2295,8 @@ pub const DeclGen = struct {
         const block = self.blocks.get(br.block_inst).?;
         const operand_ty = self.air.typeOf(br.operand);
 
-        if (operand_ty.hasRuntimeBits()) {
+        const mod = self.module;
+        if (operand_ty.hasRuntimeBits(mod)) {
             const operand_id = try self.resolve(br.operand);
             // current_block_label_id should not be undefined here, lest there is a br or br_void in the function's body.
             try block.incoming_blocks.append(self.gpa, .{ .src_label_id = self.current_block_label_id, .break_value_id = operand_id });
@@ -2341,6 +2351,7 @@ pub const DeclGen = struct {
     }
 
     fn load(self: *DeclGen, ptr_ty: Type, ptr: IdRef) !IdRef {
+        const mod = self.module;
         const value_ty = ptr_ty.childType();
         const direct_result_ty_ref = try self.resolveType(value_ty, .direct);
         const indirect_result_ty_ref = try self.resolveType(value_ty, .indirect);
@@ -2354,7 +2365,7 @@ pub const DeclGen = struct {
             .pointer = ptr,
             .memory_access = access,
         });
-        if (value_ty.zigTypeTag() == .Bool) {
+        if (value_ty.zigTypeTag(mod) == .Bool) {
             // Convert indirect bool to direct bool
             const zero_id = try self.constInt(indirect_result_ty_ref, 0);
             const casted_result_id = self.spv.allocId();
@@ -2379,8 +2390,9 @@ pub const DeclGen = struct {
     }
 
     fn store(self: *DeclGen, ptr_ty: Type, ptr: IdRef, value: IdRef) !void {
+        const mod = self.module;
         const value_ty = ptr_ty.childType();
-        const converted_value = switch (value_ty.zigTypeTag()) {
+        const converted_value = switch (value_ty.zigTypeTag(mod)) {
             .Bool => blk: {
                 const indirect_bool_ty_ref = try self.resolveType(value_ty, .indirect);
                 const result_id = self.spv.allocId();
@@ -2426,7 +2438,8 @@ pub const DeclGen = struct {
     fn airRet(self: *DeclGen, inst: Air.Inst.Index) !void {
         const operand = self.air.instructions.items(.data)[inst].un_op;
         const operand_ty = self.air.typeOf(operand);
-        if (operand_ty.hasRuntimeBits()) {
+        const mod = self.module;
+        if (operand_ty.hasRuntimeBits(mod)) {
             const operand_id = try self.resolve(operand);
             try self.func.body.emit(self.spv.gpa, .OpReturnValue, .{ .value = operand_id });
         } else {
@@ -2435,11 +2448,12 @@ pub const DeclGen = struct {
     }
 
     fn airRetLoad(self: *DeclGen, inst: Air.Inst.Index) !void {
+        const mod = self.module;
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const ptr_ty = self.air.typeOf(un_op);
         const ret_ty = ptr_ty.childType();
 
-        if (!ret_ty.hasRuntimeBitsIgnoreComptime()) {
+        if (!ret_ty.hasRuntimeBitsIgnoreComptime(mod)) {
             try self.func.body.emit(self.spv.gpa, .OpReturn, {});
             return;
         }
@@ -2452,30 +2466,29 @@ pub const DeclGen = struct {
     }
 
     fn airSwitchBr(self: *DeclGen, inst: Air.Inst.Index) !void {
-        const target = self.getTarget();
+        const mod = self.module;
         const pl_op = self.air.instructions.items(.data)[inst].pl_op;
         const cond = try self.resolve(pl_op.operand);
         const cond_ty = self.air.typeOf(pl_op.operand);
         const switch_br = self.air.extraData(Air.SwitchBr, pl_op.payload);
 
-        const cond_words: u32 = switch (cond_ty.zigTypeTag()) {
+        const cond_words: u32 = switch (cond_ty.zigTypeTag(mod)) {
             .Int => blk: {
-                const bits = cond_ty.intInfo(target).bits;
+                const bits = cond_ty.intInfo(mod).bits;
                 const backing_bits = self.backingIntBits(bits) orelse {
                     return self.todo("implement composite int switch", .{});
                 };
                 break :blk if (backing_bits <= 32) @as(u32, 1) else 2;
             },
             .Enum => blk: {
-                var buffer: Type.Payload.Bits = undefined;
-                const int_ty = cond_ty.intTagType(&buffer);
-                const int_info = int_ty.intInfo(target);
+                const int_ty = cond_ty.intTagType();
+                const int_info = int_ty.intInfo(mod);
                 const backing_bits = self.backingIntBits(int_info.bits) orelse {
                     return self.todo("implement composite int switch", .{});
                 };
                 break :blk if (backing_bits <= 32) @as(u32, 1) else 2;
             },
-            else => return self.todo("implement switch for type {s}", .{@tagName(cond_ty.zigTypeTag())}), // TODO: Figure out which types apply here, and work around them as we can only do integers.
+            else => return self.todo("implement switch for type {s}", .{@tagName(cond_ty.zigTypeTag(mod))}), // TODO: Figure out which types apply here, and work around them as we can only do integers.
         };
 
         const num_cases = switch_br.data.cases_len;
@@ -2522,12 +2535,12 @@ pub const DeclGen = struct {
                     const value = self.air.value(item) orelse {
                         return self.todo("switch on runtime value???", .{});
                     };
-                    const int_val = switch (cond_ty.zigTypeTag()) {
-                        .Int => if (cond_ty.isSignedInt()) @bitCast(u64, value.toSignedInt(target)) else value.toUnsignedInt(target),
+                    const int_val = switch (cond_ty.zigTypeTag(mod)) {
+                        .Int => if (cond_ty.isSignedInt()) @bitCast(u64, value.toSignedInt(mod)) else value.toUnsignedInt(mod),
                         .Enum => blk: {
                             var int_buffer: Value.Payload.U64 = undefined;
                             // TODO: figure out of cond_ty is correct (something with enum literals)
-                            break :blk value.enumToInt(cond_ty, &int_buffer).toUnsignedInt(target); // TODO: composite integer constants
+                            break :blk value.enumToInt(cond_ty, &int_buffer).toUnsignedInt(mod); // TODO: composite integer constants
                         },
                         else => unreachable,
                     };
@@ -2701,11 +2714,12 @@ pub const DeclGen = struct {
     fn airCall(self: *DeclGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifier) !?IdRef {
         _ = modifier;
 
+        const mod = self.module;
         const pl_op = self.air.instructions.items(.data)[inst].pl_op;
         const extra = self.air.extraData(Air.Call, pl_op.payload);
         const args = @ptrCast([]const Air.Inst.Ref, self.air.extra[extra.end..][0..extra.data.args_len]);
         const callee_ty = self.air.typeOf(pl_op.operand);
-        const zig_fn_ty = switch (callee_ty.zigTypeTag()) {
+        const zig_fn_ty = switch (callee_ty.zigTypeTag(mod)) {
             .Fn => callee_ty,
             .Pointer => return self.fail("cannot call function pointers", .{}),
             else => unreachable,
@@ -2725,7 +2739,7 @@ pub const DeclGen = struct {
         for (args) |arg| {
             const arg_id = try self.resolve(arg);
             const arg_ty = self.air.typeOf(arg);
-            if (!arg_ty.hasRuntimeBitsIgnoreComptime()) continue;
+            if (!arg_ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
 
             self.func.body.writeOperand(spec.IdRef, arg_id);
         }
@@ -2734,7 +2748,7 @@ pub const DeclGen = struct {
             try self.func.body.emit(self.spv.gpa, .OpUnreachable, {});
         }
 
-        if (self.liveness.isUnused(inst) or !return_type.hasRuntimeBitsIgnoreComptime()) {
+        if (self.liveness.isUnused(inst) or !return_type.hasRuntimeBitsIgnoreComptime(mod)) {
             return null;
         }
 

@@ -9,27 +9,99 @@ const log = std.log.scoped(.Type);
 const target_util = @import("target.zig");
 const TypedValue = @import("TypedValue.zig");
 const Sema = @import("Sema.zig");
+const InternPool = @import("InternPool.zig");
 
 const file_struct = @This();
 
-/// This is the raw data, with no bookkeeping, no memory awareness, no de-duplication.
-/// It's important for this type to be small.
-/// Types are not de-duplicated, which helps with multi-threading since it obviates the requirement
-/// of obtaining a lock on a global type table, as well as making the
-/// garbage collection bookkeeping simpler.
-/// This union takes advantage of the fact that the first page of memory
-/// is unmapped, giving us 4096 possible enum tags that have no payload.
-pub const Type = extern union {
-    /// If the tag value is less than Tag.no_payload_count, then no pointer
-    /// dereference is needed.
-    tag_if_small_enough: Tag,
-    ptr_otherwise: *Payload,
+pub const Type = struct {
+    /// We are migrating towards using this for every Type object. However, many
+    /// types are still represented the legacy way. This is indicated by using
+    /// InternPool.Index.none.
+    ip_index: InternPool.Index,
 
-    pub fn zigTypeTag(ty: Type) std.builtin.TypeId {
-        return ty.zigTypeTagOrPoison() catch unreachable;
+    /// This is the raw data, with no bookkeeping, no memory awareness, no de-duplication.
+    /// This union takes advantage of the fact that the first page of memory
+    /// is unmapped, giving us 4096 possible enum tags that have no payload.
+    legacy: extern union {
+        /// If the tag value is less than Tag.no_payload_count, then no pointer
+        /// dereference is needed.
+        tag_if_small_enough: Tag,
+        ptr_otherwise: *Payload,
+    },
+
+    pub fn zigTypeTag(ty: Type, mod: *const Module) std.builtin.TypeId {
+        return ty.zigTypeTagOrPoison(mod) catch unreachable;
     }
 
-    pub fn zigTypeTagOrPoison(ty: Type) error{GenericPoison}!std.builtin.TypeId {
+    pub fn zigTypeTagOrPoison(ty: Type, mod: *const Module) error{GenericPoison}!std.builtin.TypeId {
+        if (ty.ip_index != .none) {
+            switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+                .int_type => return .Int,
+                .ptr_type => return .Pointer,
+                .array_type => return .Array,
+                .vector_type => return .Vector,
+                .optional_type => return .Optional,
+                .error_union_type => return .ErrorUnion,
+                .simple_type => |s| switch (s) {
+                    .f16,
+                    .f32,
+                    .f64,
+                    .f80,
+                    .f128,
+                    => return .Float,
+
+                    .usize,
+                    .isize,
+                    .c_short,
+                    .c_ushort,
+                    .c_int,
+                    .c_uint,
+                    .c_long,
+                    .c_ulong,
+                    .c_longlong,
+                    .c_ulonglong,
+                    .c_longdouble,
+                    => return .Int,
+
+                    .anyopaque => return .Opaque,
+                    .bool => return .Bool,
+                    .void => return .Void,
+                    .type => return .Type,
+                    .anyerror => return .ErrorSet,
+                    .comptime_int => return .ComptimeInt,
+                    .comptime_float => return .ComptimeFloat,
+                    .noreturn => return .NoReturn,
+                    .@"anyframe" => return .AnyFrame,
+                    .null_type => return .Null,
+                    .undefined => return .Undefined,
+                    .enum_literal => return .EnumLiteral,
+
+                    .atomic_order,
+                    .atomic_rmw_op,
+                    .calling_convention,
+                    .address_space,
+                    .float_mode,
+                    .reduce_op,
+                    => return .Enum,
+
+                    .call_options,
+                    .prefetch_options,
+                    .export_options,
+                    .extern_options,
+                    => return .Struct,
+
+                    .type_info => return .Union,
+
+                    .generic_poison => unreachable,
+                },
+
+                .extern_func,
+                .int,
+                .enum_tag,
+                .simple_value,
+                => unreachable, // it's a value, not a type
+            }
+        }
         switch (ty.tag()) {
             .generic_poison => return error.GenericPoison,
 
@@ -56,8 +128,6 @@ pub const Type = extern union {
             .c_ulong,
             .c_longlong,
             .c_ulonglong,
-            .int_signed,
-            .int_unsigned,
             => return .Int,
 
             .f16,
@@ -85,10 +155,6 @@ pub const Type = extern union {
             .null => return .Null,
             .undefined => return .Undefined,
 
-            .fn_noreturn_no_args => return .Fn,
-            .fn_void_no_args => return .Fn,
-            .fn_naked_noreturn_no_args => return .Fn,
-            .fn_ccc_void_no_args => return .Fn,
             .function => return .Fn,
 
             .array,
@@ -162,19 +228,19 @@ pub const Type = extern union {
         }
     }
 
-    pub fn baseZigTypeTag(self: Type) std.builtin.TypeId {
-        return switch (self.zigTypeTag()) {
-            .ErrorUnion => self.errorUnionPayload().baseZigTypeTag(),
+    pub fn baseZigTypeTag(self: Type, mod: *const Module) std.builtin.TypeId {
+        return switch (self.zigTypeTag(mod)) {
+            .ErrorUnion => self.errorUnionPayload().baseZigTypeTag(mod),
             .Optional => {
                 var buf: Payload.ElemType = undefined;
-                return self.optionalChild(&buf).baseZigTypeTag();
+                return self.optionalChild(&buf).baseZigTypeTag(mod);
             },
             else => |t| t,
         };
     }
 
-    pub fn isSelfComparable(ty: Type, is_equality_cmp: bool) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isSelfComparable(ty: Type, mod: *const Module, is_equality_cmp: bool) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Int,
             .Float,
             .ComptimeFloat,
@@ -208,44 +274,54 @@ pub const Type = extern union {
             .Optional => {
                 if (!is_equality_cmp) return false;
                 var buf: Payload.ElemType = undefined;
-                return ty.optionalChild(&buf).isSelfComparable(is_equality_cmp);
+                return ty.optionalChild(&buf).isSelfComparable(mod, is_equality_cmp);
             },
         };
     }
 
     pub fn initTag(comptime small_tag: Tag) Type {
         comptime assert(@enumToInt(small_tag) < Tag.no_payload_count);
-        return .{ .tag_if_small_enough = small_tag };
+        return Type{
+            .ip_index = .none,
+            .legacy = .{ .tag_if_small_enough = small_tag },
+        };
     }
 
     pub fn initPayload(payload: *Payload) Type {
         assert(@enumToInt(payload.tag) >= Tag.no_payload_count);
-        return .{ .ptr_otherwise = payload };
+        return Type{
+            .ip_index = .none,
+            .legacy = .{ .ptr_otherwise = payload },
+        };
     }
 
-    pub fn tag(self: Type) Tag {
-        if (@enumToInt(self.tag_if_small_enough) < Tag.no_payload_count) {
-            return self.tag_if_small_enough;
+    pub fn tag(ty: Type) Tag {
+        assert(ty.ip_index == .none);
+        if (@enumToInt(ty.legacy.tag_if_small_enough) < Tag.no_payload_count) {
+            return ty.legacy.tag_if_small_enough;
         } else {
-            return self.ptr_otherwise.tag;
+            return ty.legacy.ptr_otherwise.tag;
         }
     }
 
     /// Prefer `castTag` to this.
     pub fn cast(self: Type, comptime T: type) ?*T {
+        if (self.ip_index != .none) {
+            return null;
+        }
         if (@hasField(T, "base_tag")) {
             return self.castTag(T.base_tag);
         }
-        if (@enumToInt(self.tag_if_small_enough) < Tag.no_payload_count) {
+        if (@enumToInt(self.legacy.tag_if_small_enough) < Tag.no_payload_count) {
             return null;
         }
         inline for (@typeInfo(Tag).Enum.fields) |field| {
             if (field.value < Tag.no_payload_count)
                 continue;
             const t = @intToEnum(Tag, field.value);
-            if (self.ptr_otherwise.tag == t) {
+            if (self.legacy.ptr_otherwise.tag == t) {
                 if (T == t.Type()) {
-                    return @fieldParentPtr(T, "base", self.ptr_otherwise);
+                    return @fieldParentPtr(T, "base", self.legacy.ptr_otherwise);
                 }
                 return null;
             }
@@ -254,11 +330,14 @@ pub const Type = extern union {
     }
 
     pub fn castTag(self: Type, comptime t: Tag) ?*t.Type() {
-        if (@enumToInt(self.tag_if_small_enough) < Tag.no_payload_count)
+        if (self.ip_index != .none) {
+            return null;
+        }
+        if (@enumToInt(self.legacy.tag_if_small_enough) < Tag.no_payload_count)
             return null;
 
-        if (self.ptr_otherwise.tag == t)
-            return @fieldParentPtr(t.Type(), "base", self.ptr_otherwise);
+        if (self.legacy.ptr_otherwise.tag == t)
+            return @fieldParentPtr(t.Type(), "base", self.legacy.ptr_otherwise);
 
         return null;
     }
@@ -288,10 +367,10 @@ pub const Type = extern union {
     }
 
     /// If it is a function pointer, returns the function type. Otherwise returns null.
-    pub fn castPtrToFn(ty: Type) ?Type {
-        if (ty.zigTypeTag() != .Pointer) return null;
+    pub fn castPtrToFn(ty: Type, mod: *const Module) ?Type {
+        if (ty.zigTypeTag(mod) != .Pointer) return null;
         const elem_ty = ty.childType();
-        if (elem_ty.zigTypeTag() != .Fn) return null;
+        if (elem_ty.zigTypeTag(mod) != .Fn) return null;
         return elem_ty;
     }
 
@@ -539,7 +618,10 @@ pub const Type = extern union {
 
     pub fn eql(a: Type, b: Type, mod: *Module) bool {
         // As a shortcut, if the small tags / addresses match, we're done.
-        if (a.tag_if_small_enough == b.tag_if_small_enough) return true;
+        if (a.ip_index != .none or b.ip_index != .none) {
+            return a.ip_index == b.ip_index;
+        }
+        if (a.legacy.tag_if_small_enough == b.legacy.tag_if_small_enough) return true;
 
         switch (a.tag()) {
             .generic_poison => unreachable,
@@ -592,16 +674,11 @@ pub const Type = extern union {
             .i64,
             .u128,
             .i128,
-            .int_signed,
-            .int_unsigned,
             => {
-                if (b.zigTypeTag() != .Int) return false;
+                if (b.zigTypeTag(mod) != .Int) return false;
                 if (b.isNamedInt()) return false;
-
-                // Arbitrary sized integers. The target will not be branched upon,
-                // because we handled target-dependent cases above.
-                const info_a = a.intInfo(@as(Target, undefined));
-                const info_b = b.intInfo(@as(Target, undefined));
+                const info_a = a.intInfo(mod);
+                const info_b = b.intInfo(mod);
                 return info_a.signedness == info_b.signedness and info_a.bits == info_b.bits;
             },
 
@@ -644,13 +721,8 @@ pub const Type = extern union {
                 return opaque_obj_a == opaque_obj_b;
             },
 
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
-            .function,
-            => {
-                if (b.zigTypeTag() != .Fn) return false;
+            .function => {
+                if (b.zigTypeTag(mod) != .Fn) return false;
 
                 const a_info = a.fnInfo();
                 const b_info = b.fnInfo();
@@ -702,7 +774,7 @@ pub const Type = extern union {
             .array_sentinel,
             .vector,
             => {
-                if (a.zigTypeTag() != b.zigTypeTag()) return false;
+                if (a.zigTypeTag(mod) != b.zigTypeTag(mod)) return false;
 
                 if (a.arrayLen() != b.arrayLen())
                     return false;
@@ -740,7 +812,7 @@ pub const Type = extern union {
             .manyptr_const_u8,
             .manyptr_const_u8_sentinel_0,
             => {
-                if (b.zigTypeTag() != .Pointer) return false;
+                if (b.zigTypeTag(mod) != .Pointer) return false;
 
                 const info_a = a.ptrInfo().data;
                 const info_b = b.ptrInfo().data;
@@ -786,7 +858,7 @@ pub const Type = extern union {
             .optional_single_const_pointer,
             .optional_single_mut_pointer,
             => {
-                if (b.zigTypeTag() != .Optional) return false;
+                if (b.zigTypeTag(mod) != .Optional) return false;
 
                 var buf_a: Payload.ElemType = undefined;
                 var buf_b: Payload.ElemType = undefined;
@@ -794,7 +866,7 @@ pub const Type = extern union {
             },
 
             .anyerror_void_error_union, .error_union => {
-                if (b.zigTypeTag() != .ErrorUnion) return false;
+                if (b.zigTypeTag(mod) != .ErrorUnion) return false;
 
                 const a_set = a.errorUnionSet();
                 const b_set = b.errorUnionSet();
@@ -808,7 +880,7 @@ pub const Type = extern union {
             },
 
             .anyframe_T => {
-                if (b.zigTypeTag() != .AnyFrame) return false;
+                if (b.zigTypeTag(mod) != .AnyFrame) return false;
                 return a.elemType2().eql(b.elemType2(), mod);
             },
 
@@ -946,6 +1018,9 @@ pub const Type = extern union {
     }
 
     pub fn hashWithHasher(ty: Type, hasher: *std.hash.Wyhash, mod: *Module) void {
+        if (ty.ip_index != .none) {
+            return mod.intern_pool.indexToKey(ty.ip_index).hashWithHasher(hasher);
+        }
         switch (ty.tag()) {
             .generic_poison => unreachable,
 
@@ -1012,13 +1087,10 @@ pub const Type = extern union {
             .i64,
             .u128,
             .i128,
-            .int_signed,
-            .int_unsigned,
             => {
-                // Arbitrary sized integers. The target will not be branched upon,
-                // because we handled target-dependent cases above.
+                // Arbitrary sized integers.
                 std.hash.autoHash(hasher, std.builtin.TypeId.Int);
-                const info = ty.intInfo(@as(Target, undefined));
+                const info = ty.intInfo(mod);
                 std.hash.autoHash(hasher, info.signedness);
                 std.hash.autoHash(hasher, info.bits);
             },
@@ -1057,12 +1129,7 @@ pub const Type = extern union {
                 std.hash.autoHash(hasher, opaque_obj);
             },
 
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
-            .function,
-            => {
+            .function => {
                 std.hash.autoHash(hasher, std.builtin.TypeId.Fn);
 
                 const fn_info = ty.fnInfo();
@@ -1282,9 +1349,15 @@ pub const Type = extern union {
     };
 
     pub fn copy(self: Type, allocator: Allocator) error{OutOfMemory}!Type {
-        if (@enumToInt(self.tag_if_small_enough) < Tag.no_payload_count) {
-            return Type{ .tag_if_small_enough = self.tag_if_small_enough };
-        } else switch (self.ptr_otherwise.tag) {
+        if (self.ip_index != .none) {
+            return Type{ .ip_index = self.ip_index, .legacy = undefined };
+        }
+        if (@enumToInt(self.legacy.tag_if_small_enough) < Tag.no_payload_count) {
+            return Type{
+                .ip_index = .none,
+                .legacy = .{ .tag_if_small_enough = self.legacy.tag_if_small_enough },
+            };
+        } else switch (self.legacy.ptr_otherwise.tag) {
             .u1,
             .u8,
             .i8,
@@ -1324,10 +1397,6 @@ pub const Type = extern union {
             .noreturn,
             .null,
             .undefined,
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
             .single_const_pointer_to_comptime_int,
             .const_slice_u8,
             .const_slice_u8_sentinel_0,
@@ -1379,12 +1448,11 @@ pub const Type = extern union {
                     .base = .{ .tag = payload.base.tag },
                     .data = try payload.data.copy(allocator),
                 };
-                return Type{ .ptr_otherwise = &new_payload.base };
+                return Type{
+                    .ip_index = .none,
+                    .legacy = .{ .ptr_otherwise = &new_payload.base },
+                };
             },
-
-            .int_signed,
-            .int_unsigned,
-            => return self.copyPayloadShallow(allocator, Payload.Bits),
 
             .vector => {
                 const payload = self.castTag(.vector).?.data;
@@ -1520,7 +1588,10 @@ pub const Type = extern union {
         const payload = self.cast(T).?;
         const new_payload = try allocator.create(T);
         new_payload.* = payload.*;
-        return Type{ .ptr_otherwise = &new_payload.base };
+        return Type{
+            .ip_index = .none,
+            .legacy = .{ .ptr_otherwise = &new_payload.base },
+        };
     }
 
     pub fn format(ty: Type, comptime unused_fmt_string: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
@@ -1559,7 +1630,7 @@ pub const Type = extern union {
     }
 
     /// This is a debug function. In order to print types in a meaningful way
-    /// we also need access to the target.
+    /// we also need access to the module.
     pub fn dump(
         start_type: Type,
         comptime unused_format_string: []const u8,
@@ -1568,10 +1639,13 @@ pub const Type = extern union {
     ) @TypeOf(writer).Error!void {
         _ = options;
         comptime assert(unused_format_string.len == 0);
+        if (start_type.ip_index != .none) {
+            return writer.print("(intern index: {d})", .{@enumToInt(start_type.ip_index)});
+        }
         if (true) {
-            // This is disabled to work around a bug where this function
-            // recursively causes more generic function instantiations
-            // resulting in an infinite loop in the compiler.
+            // This is disabled to work around a stage2 bug where this function recursively
+            // causes more generic function instantiations resulting in an infinite loop
+            // in the compiler.
             try writer.writeAll("[TODO fix internal compiler bug regarding dump]");
             return;
         }
@@ -1667,10 +1741,6 @@ pub const Type = extern union {
                 .anyerror_void_error_union => return writer.writeAll("anyerror!void"),
                 .const_slice_u8 => return writer.writeAll("[]const u8"),
                 .const_slice_u8_sentinel_0 => return writer.writeAll("[:0]const u8"),
-                .fn_noreturn_no_args => return writer.writeAll("fn() noreturn"),
-                .fn_void_no_args => return writer.writeAll("fn() void"),
-                .fn_naked_noreturn_no_args => return writer.writeAll("fn() callconv(.Naked) noreturn"),
-                .fn_ccc_void_no_args => return writer.writeAll("fn() callconv(.C) void"),
                 .single_const_pointer_to_comptime_int => return writer.writeAll("*const comptime_int"),
                 .manyptr_u8 => return writer.writeAll("[*]u8"),
                 .manyptr_const_u8 => return writer.writeAll("[*]const u8"),
@@ -1831,14 +1901,6 @@ pub const Type = extern union {
                     ty = pointee_type;
                     continue;
                 },
-                .int_signed => {
-                    const bits = ty.castTag(.int_signed).?.data;
-                    return writer.print("i{d}", .{bits});
-                },
-                .int_unsigned => {
-                    const bits = ty.castTag(.int_unsigned).?.data;
-                    return writer.print("u{d}", .{bits});
-                },
                 .optional => {
                     const child_type = ty.castTag(.optional).?.data;
                     try writer.writeByte('?');
@@ -1948,7 +2010,26 @@ pub const Type = extern union {
     }
 
     /// Prints a name suitable for `@typeName`.
-    pub fn print(ty: Type, writer: anytype, mod: *Module) @TypeOf(writer).Error!void {
+    pub fn print(ty: Type, writer: anytype, mod: *const Module) @TypeOf(writer).Error!void {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| {
+                const sign_char = switch (int_type.signedness) {
+                    .signed => 'i',
+                    .unsigned => 'u',
+                };
+                return writer.print("{c}{d}", .{ sign_char, int_type.bits });
+            },
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => |s| return writer.writeAll(@tagName(s)),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable,
+        };
         const t = ty.tag();
         switch (t) {
             .inferred_alloc_const => unreachable,
@@ -2054,10 +2135,6 @@ pub const Type = extern union {
             .anyerror_void_error_union => try writer.writeAll("anyerror!void"),
             .const_slice_u8 => try writer.writeAll("[]const u8"),
             .const_slice_u8_sentinel_0 => try writer.writeAll("[:0]const u8"),
-            .fn_noreturn_no_args => try writer.writeAll("fn() noreturn"),
-            .fn_void_no_args => try writer.writeAll("fn() void"),
-            .fn_naked_noreturn_no_args => try writer.writeAll("fn() callconv(.Naked) noreturn"),
-            .fn_ccc_void_no_args => try writer.writeAll("fn() callconv(.C) void"),
             .single_const_pointer_to_comptime_int => try writer.writeAll("*const comptime_int"),
             .manyptr_u8 => try writer.writeAll("[*]u8"),
             .manyptr_const_u8 => try writer.writeAll("[*]const u8"),
@@ -2213,7 +2290,7 @@ pub const Type = extern union {
                     if (info.@"align" != 0) {
                         try writer.print("align({d}", .{info.@"align"});
                     } else {
-                        const alignment = info.pointee_type.abiAlignment(mod.getTarget());
+                        const alignment = info.pointee_type.abiAlignment(mod);
                         try writer.print("align({d}", .{alignment});
                     }
 
@@ -2237,14 +2314,6 @@ pub const Type = extern union {
                 try print(info.pointee_type, writer, mod);
             },
 
-            .int_signed => {
-                const bits = ty.castTag(.int_signed).?.data;
-                return writer.print("i{d}", .{bits});
-            },
-            .int_unsigned => {
-                const bits = ty.castTag(.int_unsigned).?.data;
-                return writer.print("u{d}", .{bits});
-            },
             .optional => {
                 const child_type = ty.castTag(.optional).?.data;
                 try writer.writeByte('?');
@@ -2330,10 +2399,6 @@ pub const Type = extern union {
             .noreturn => return Value.initTag(.noreturn_type),
             .null => return Value.initTag(.null_type),
             .undefined => return Value.initTag(.undefined_type),
-            .fn_noreturn_no_args => return Value.initTag(.fn_noreturn_no_args_type),
-            .fn_void_no_args => return Value.initTag(.fn_void_no_args_type),
-            .fn_naked_noreturn_no_args => return Value.initTag(.fn_naked_noreturn_no_args_type),
-            .fn_ccc_void_no_args => return Value.initTag(.fn_ccc_void_no_args_type),
             .single_const_pointer_to_comptime_int => return Value.initTag(.single_const_pointer_to_comptime_int_type),
             .const_slice_u8 => return Value.initTag(.const_slice_u8_type),
             .const_slice_u8_sentinel_0 => return Value.initTag(.const_slice_u8_sentinel_0_type),
@@ -2373,9 +2438,23 @@ pub const Type = extern union {
     /// may return false positives.
     pub fn hasRuntimeBitsAdvanced(
         ty: Type,
+        mod: *const Module,
         ignore_comptime_only: bool,
         strat: AbiAlignmentAdvancedStrat,
-    ) RuntimeBitsError!bool {
+    ) Module.CompileError!bool {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| return int_type.bits != 0,
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
         switch (ty.tag()) {
             .u1,
             .u8,
@@ -2453,12 +2532,12 @@ pub const Type = extern union {
             => {
                 if (ignore_comptime_only) {
                     return true;
-                } else if (ty.childType().zigTypeTag() == .Fn) {
+                } else if (ty.childType().zigTypeTag(mod) == .Fn) {
                     return !ty.childType().fnInfo().is_generic;
                 } else if (strat == .sema) {
                     return !(try strat.sema.typeRequiresComptime(ty));
                 } else {
-                    return !comptimeOnly(ty);
+                    return !comptimeOnly(ty, mod);
                 }
             },
 
@@ -2479,10 +2558,6 @@ pub const Type = extern union {
             // Special exceptions have to be made when emitting functions due to
             // this returning false.
             .function,
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
             => return false,
 
             .optional => {
@@ -2497,7 +2572,7 @@ pub const Type = extern union {
                 } else if (strat == .sema) {
                     return !(try strat.sema.typeRequiresComptime(child_ty));
                 } else {
-                    return !comptimeOnly(child_ty);
+                    return !comptimeOnly(child_ty, mod);
                 }
             },
 
@@ -2516,7 +2591,7 @@ pub const Type = extern union {
                 }
                 for (struct_obj.fields.values()) |field| {
                     if (field.is_comptime) continue;
-                    if (try field.ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat))
+                    if (try field.ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat))
                         return true;
                 } else {
                     return false;
@@ -2525,16 +2600,15 @@ pub const Type = extern union {
 
             .enum_full => {
                 const enum_full = ty.castTag(.enum_full).?.data;
-                return enum_full.tag_ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat);
+                return enum_full.tag_ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat);
             },
             .enum_simple => {
                 const enum_simple = ty.castTag(.enum_simple).?.data;
                 return enum_simple.fields.count() >= 2;
             },
             .enum_numbered, .enum_nonexhaustive => {
-                var buffer: Payload.Bits = undefined;
-                const int_tag_ty = ty.intTagType(&buffer);
-                return int_tag_ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat);
+                const int_tag_ty = ty.intTagType();
+                return int_tag_ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat);
             },
 
             .@"union" => {
@@ -2551,7 +2625,7 @@ pub const Type = extern union {
                     .lazy => if (!union_obj.haveFieldTypes()) return error.NeedLazy,
                 }
                 for (union_obj.fields.values()) |value| {
-                    if (try value.ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat))
+                    if (try value.ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat))
                         return true;
                 } else {
                     return false;
@@ -2559,7 +2633,7 @@ pub const Type = extern union {
             },
             .union_safety_tagged, .union_tagged => {
                 const union_obj = ty.cast(Payload.Union).?.data;
-                if (try union_obj.tag_ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat)) {
+                if (try union_obj.tag_ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat)) {
                     return true;
                 }
 
@@ -2569,7 +2643,7 @@ pub const Type = extern union {
                     .lazy => if (!union_obj.haveFieldTypes()) return error.NeedLazy,
                 }
                 for (union_obj.fields.values()) |value| {
-                    if (try value.ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat))
+                    if (try value.ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat))
                         return true;
                 } else {
                     return false;
@@ -2577,18 +2651,16 @@ pub const Type = extern union {
             },
 
             .array, .vector => return ty.arrayLen() != 0 and
-                try ty.elemType().hasRuntimeBitsAdvanced(ignore_comptime_only, strat),
+                try ty.elemType().hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat),
             .array_u8 => return ty.arrayLen() != 0,
-            .array_sentinel => return ty.childType().hasRuntimeBitsAdvanced(ignore_comptime_only, strat),
-
-            .int_signed, .int_unsigned => return ty.cast(Payload.Bits).?.data != 0,
+            .array_sentinel => return ty.childType().hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat),
 
             .tuple, .anon_struct => {
                 const tuple = ty.tupleFields();
                 for (tuple.types, 0..) |field_ty, i| {
                     const val = tuple.values[i];
                     if (val.tag() != .unreachable_value) continue; // comptime field
-                    if (try field_ty.hasRuntimeBitsAdvanced(ignore_comptime_only, strat)) return true;
+                    if (try field_ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat)) return true;
                 }
                 return false;
             },
@@ -2603,7 +2675,20 @@ pub const Type = extern union {
     /// true if and only if the type has a well-defined memory layout
     /// readFrom/writeToMemory are supported only for types with a well-
     /// defined memory layout
-    pub fn hasWellDefinedLayout(ty: Type) bool {
+    pub fn hasWellDefinedLayout(ty: Type, mod: *const Module) bool {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => return true,
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
         return switch (ty.tag()) {
             .u1,
             .u8,
@@ -2641,8 +2726,6 @@ pub const Type = extern union {
             .manyptr_const_u8_sentinel_0,
             .array_u8,
             .array_u8_sentinel_0,
-            .int_signed,
-            .int_unsigned,
             .pointer,
             .single_const_pointer,
             .single_mut_pointer,
@@ -2685,10 +2768,6 @@ pub const Type = extern union {
             .enum_literal,
             .type_info,
             // These are function bodies, not function pointers.
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
             .function,
             .const_slice_u8,
             .const_slice_u8_sentinel_0,
@@ -2715,25 +2794,25 @@ pub const Type = extern union {
 
             .array,
             .array_sentinel,
-            => ty.childType().hasWellDefinedLayout(),
+            => ty.childType().hasWellDefinedLayout(mod),
 
-            .optional => ty.isPtrLikeOptional(),
+            .optional => ty.isPtrLikeOptional(mod),
             .@"struct" => ty.castTag(.@"struct").?.data.layout != .Auto,
             .@"union", .union_safety_tagged => ty.cast(Payload.Union).?.data.layout != .Auto,
             .union_tagged => false,
         };
     }
 
-    pub fn hasRuntimeBits(ty: Type) bool {
-        return hasRuntimeBitsAdvanced(ty, false, .eager) catch unreachable;
+    pub fn hasRuntimeBits(ty: Type, mod: *const Module) bool {
+        return hasRuntimeBitsAdvanced(ty, mod, false, .eager) catch unreachable;
     }
 
-    pub fn hasRuntimeBitsIgnoreComptime(ty: Type) bool {
-        return hasRuntimeBitsAdvanced(ty, true, .eager) catch unreachable;
+    pub fn hasRuntimeBitsIgnoreComptime(ty: Type, mod: *const Module) bool {
+        return hasRuntimeBitsAdvanced(ty, mod, true, .eager) catch unreachable;
     }
 
-    pub fn isFnOrHasRuntimeBits(ty: Type) bool {
-        switch (ty.zigTypeTag()) {
+    pub fn isFnOrHasRuntimeBits(ty: Type, mod: *const Module) bool {
+        switch (ty.zigTypeTag(mod)) {
             .Fn => {
                 const fn_info = ty.fnInfo();
                 if (fn_info.is_generic) return false;
@@ -2744,18 +2823,18 @@ pub const Type = extern union {
                     .Inline => return false,
                     else => {},
                 }
-                if (fn_info.return_type.comptimeOnly()) return false;
+                if (fn_info.return_type.comptimeOnly(mod)) return false;
                 return true;
             },
-            else => return ty.hasRuntimeBits(),
+            else => return ty.hasRuntimeBits(mod),
         }
     }
 
     /// Same as `isFnOrHasRuntimeBits` but comptime-only types may return a false positive.
-    pub fn isFnOrHasRuntimeBitsIgnoreComptime(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isFnOrHasRuntimeBitsIgnoreComptime(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Fn => true,
-            else => return ty.hasRuntimeBitsIgnoreComptime(),
+            else => return ty.hasRuntimeBitsIgnoreComptime(mod),
         };
     }
 
@@ -2778,11 +2857,11 @@ pub const Type = extern union {
     }
 
     /// Returns 0 if the pointer is naturally aligned and the element type is 0-bit.
-    pub fn ptrAlignment(ty: Type, target: Target) u32 {
-        return ptrAlignmentAdvanced(ty, target, null) catch unreachable;
+    pub fn ptrAlignment(ty: Type, mod: *const Module) u32 {
+        return ptrAlignmentAdvanced(ty, mod, null) catch unreachable;
     }
 
-    pub fn ptrAlignmentAdvanced(ty: Type, target: Target, opt_sema: ?*Sema) !u32 {
+    pub fn ptrAlignmentAdvanced(ty: Type, mod: *const Module, opt_sema: ?*Sema) !u32 {
         switch (ty.tag()) {
             .single_const_pointer,
             .single_mut_pointer,
@@ -2797,10 +2876,10 @@ pub const Type = extern union {
             => {
                 const child_type = ty.cast(Payload.ElemType).?.data;
                 if (opt_sema) |sema| {
-                    const res = try child_type.abiAlignmentAdvanced(target, .{ .sema = sema });
+                    const res = try child_type.abiAlignmentAdvanced(mod, .{ .sema = sema });
                     return res.scalar;
                 }
-                return (child_type.abiAlignmentAdvanced(target, .eager) catch unreachable).scalar;
+                return (child_type.abiAlignmentAdvanced(mod, .eager) catch unreachable).scalar;
             },
 
             .manyptr_u8,
@@ -2815,13 +2894,13 @@ pub const Type = extern union {
                 if (ptr_info.@"align" != 0) {
                     return ptr_info.@"align";
                 } else if (opt_sema) |sema| {
-                    const res = try ptr_info.pointee_type.abiAlignmentAdvanced(target, .{ .sema = sema });
+                    const res = try ptr_info.pointee_type.abiAlignmentAdvanced(mod, .{ .sema = sema });
                     return res.scalar;
                 } else {
-                    return (ptr_info.pointee_type.abiAlignmentAdvanced(target, .eager) catch unreachable).scalar;
+                    return (ptr_info.pointee_type.abiAlignmentAdvanced(mod, .eager) catch unreachable).scalar;
                 }
             },
-            .optional => return ty.castTag(.optional).?.data.ptrAlignmentAdvanced(target, opt_sema),
+            .optional => return ty.castTag(.optional).?.data.ptrAlignmentAdvanced(mod, opt_sema),
 
             else => unreachable,
         }
@@ -2860,13 +2939,13 @@ pub const Type = extern union {
     }
 
     /// Returns 0 for 0-bit types.
-    pub fn abiAlignment(ty: Type, target: Target) u32 {
-        return (ty.abiAlignmentAdvanced(target, .eager) catch unreachable).scalar;
+    pub fn abiAlignment(ty: Type, mod: *const Module) u32 {
+        return (ty.abiAlignmentAdvanced(mod, .eager) catch unreachable).scalar;
     }
 
     /// May capture a reference to `ty`.
-    pub fn lazyAbiAlignment(ty: Type, target: Target, arena: Allocator) !Value {
-        switch (try ty.abiAlignmentAdvanced(target, .{ .lazy = arena })) {
+    pub fn lazyAbiAlignment(ty: Type, mod: *const Module, arena: Allocator) !Value {
+        switch (try ty.abiAlignmentAdvanced(mod, .{ .lazy = arena })) {
             .val => |val| return val,
             .scalar => |x| return Value.Tag.int_u64.create(arena, x),
         }
@@ -2891,9 +2970,28 @@ pub const Type = extern union {
     /// necessary, possibly returning a CompileError.
     pub fn abiAlignmentAdvanced(
         ty: Type,
-        target: Target,
+        mod: *const Module,
         strat: AbiAlignmentAdvancedStrat,
     ) Module.CompileError!AbiAlignmentAdvanced {
+        const target = mod.getTarget();
+
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| {
+                if (int_type.bits == 0) return AbiAlignmentAdvanced{ .scalar = 0 };
+                return AbiAlignmentAdvanced{ .scalar = intAbiAlignment(int_type.bits, target) };
+            },
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         const opt_sema = switch (strat) {
             .sema => |sema| sema,
             else => null,
@@ -2918,12 +3016,6 @@ pub const Type = extern union {
             .@"opaque",
             .anyopaque,
             => return AbiAlignmentAdvanced{ .scalar = 1 },
-
-            .fn_noreturn_no_args, // represents machine code; not a pointer
-            .fn_void_no_args, // represents machine code; not a pointer
-            .fn_naked_noreturn_no_args, // represents machine code; not a pointer
-            .fn_ccc_void_no_args, // represents machine code; not a pointer
-            => return AbiAlignmentAdvanced{ .scalar = target_util.defaultFunctionAlignment(target) },
 
             // represents machine code; not a pointer
             .function => {
@@ -2980,7 +3072,7 @@ pub const Type = extern union {
                         .data = 80,
                     };
                     const u80_ty = initPayload(&payload.base);
-                    return AbiAlignmentAdvanced{ .scalar = abiAlignment(u80_ty, target) };
+                    return AbiAlignmentAdvanced{ .scalar = abiAlignment(u80_ty, mod) };
                 },
             },
             .f128 => switch (target.c_type_bit_size(.longdouble)) {
@@ -2997,11 +3089,11 @@ pub const Type = extern union {
             .error_set_merged,
             => return AbiAlignmentAdvanced{ .scalar = 2 },
 
-            .array, .array_sentinel => return ty.elemType().abiAlignmentAdvanced(target, strat),
+            .array, .array_sentinel => return ty.elemType().abiAlignmentAdvanced(mod, strat),
 
             .vector => {
                 const len = ty.arrayLen();
-                const bits = try bitSizeAdvanced(ty.elemType(), target, opt_sema);
+                const bits = try bitSizeAdvanced(ty.elemType(), mod, opt_sema);
                 const bytes = ((bits * len) + 7) / 8;
                 const alignment = std.math.ceilPowerOfTwoAssert(u64, bytes);
                 return AbiAlignmentAdvanced{ .scalar = @intCast(u32, alignment) };
@@ -3013,34 +3105,28 @@ pub const Type = extern union {
             .i64, .u64 => return AbiAlignmentAdvanced{ .scalar = intAbiAlignment(64, target) },
             .u128, .i128 => return AbiAlignmentAdvanced{ .scalar = intAbiAlignment(128, target) },
 
-            .int_signed, .int_unsigned => {
-                const bits: u16 = ty.cast(Payload.Bits).?.data;
-                if (bits == 0) return AbiAlignmentAdvanced{ .scalar = 0 };
-                return AbiAlignmentAdvanced{ .scalar = intAbiAlignment(bits, target) };
-            },
-
             .optional => {
                 var buf: Payload.ElemType = undefined;
                 const child_type = ty.optionalChild(&buf);
 
-                switch (child_type.zigTypeTag()) {
+                switch (child_type.zigTypeTag(mod)) {
                     .Pointer => return AbiAlignmentAdvanced{ .scalar = @divExact(target.cpu.arch.ptrBitWidth(), 8) },
-                    .ErrorSet => return abiAlignmentAdvanced(Type.anyerror, target, strat),
+                    .ErrorSet => return abiAlignmentAdvanced(Type.anyerror, mod, strat),
                     .NoReturn => return AbiAlignmentAdvanced{ .scalar = 0 },
                     else => {},
                 }
 
                 switch (strat) {
                     .eager, .sema => {
-                        if (!(child_type.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+                        if (!(child_type.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                             error.NeedLazy => return AbiAlignmentAdvanced{ .val = try Value.Tag.lazy_align.create(strat.lazy, ty) },
                             else => |e| return e,
                         })) {
                             return AbiAlignmentAdvanced{ .scalar = 1 };
                         }
-                        return child_type.abiAlignmentAdvanced(target, strat);
+                        return child_type.abiAlignmentAdvanced(mod, strat);
                     },
-                    .lazy => |arena| switch (try child_type.abiAlignmentAdvanced(target, strat)) {
+                    .lazy => |arena| switch (try child_type.abiAlignmentAdvanced(mod, strat)) {
                         .scalar => |x| return AbiAlignmentAdvanced{ .scalar = @max(x, 1) },
                         .val => return AbiAlignmentAdvanced{ .val = try Value.Tag.lazy_align.create(arena, ty) },
                     },
@@ -3051,10 +3137,10 @@ pub const Type = extern union {
                 // This code needs to be kept in sync with the equivalent switch prong
                 // in abiSizeAdvanced.
                 const data = ty.castTag(.error_union).?.data;
-                const code_align = abiAlignment(Type.anyerror, target);
+                const code_align = abiAlignment(Type.anyerror, mod);
                 switch (strat) {
                     .eager, .sema => {
-                        if (!(data.payload.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+                        if (!(data.payload.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                             error.NeedLazy => return AbiAlignmentAdvanced{ .val = try Value.Tag.lazy_align.create(strat.lazy, ty) },
                             else => |e| return e,
                         })) {
@@ -3062,11 +3148,11 @@ pub const Type = extern union {
                         }
                         return AbiAlignmentAdvanced{ .scalar = @max(
                             code_align,
-                            (try data.payload.abiAlignmentAdvanced(target, strat)).scalar,
+                            (try data.payload.abiAlignmentAdvanced(mod, strat)).scalar,
                         ) };
                     },
                     .lazy => |arena| {
-                        switch (try data.payload.abiAlignmentAdvanced(target, strat)) {
+                        switch (try data.payload.abiAlignmentAdvanced(mod, strat)) {
                             .scalar => |payload_align| {
                                 return AbiAlignmentAdvanced{
                                     .scalar = @max(code_align, payload_align),
@@ -3106,20 +3192,20 @@ pub const Type = extern union {
                         .eager => {},
                     }
                     assert(struct_obj.haveLayout());
-                    return AbiAlignmentAdvanced{ .scalar = struct_obj.backing_int_ty.abiAlignment(target) };
+                    return AbiAlignmentAdvanced{ .scalar = struct_obj.backing_int_ty.abiAlignment(mod) };
                 }
 
                 const fields = ty.structFields();
                 var big_align: u32 = 0;
                 for (fields.values()) |field| {
-                    if (!(field.ty.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+                    if (!(field.ty.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                         error.NeedLazy => return AbiAlignmentAdvanced{ .val = try Value.Tag.lazy_align.create(strat.lazy, ty) },
                         else => |e| return e,
                     })) continue;
 
                     const field_align = if (field.abi_align != 0)
                         field.abi_align
-                    else switch (try field.ty.abiAlignmentAdvanced(target, strat)) {
+                    else switch (try field.ty.abiAlignmentAdvanced(mod, strat)) {
                         .scalar => |a| a,
                         .val => switch (strat) {
                             .eager => unreachable, // struct layout not resolved
@@ -3131,7 +3217,7 @@ pub const Type = extern union {
 
                     // This logic is duplicated in Module.Struct.Field.alignment.
                     if (struct_obj.layout == .Extern or target.ofmt == .c) {
-                        if (field.ty.isAbiInt() and field.ty.intInfo(target).bits >= 128) {
+                        if (field.ty.isAbiInt(mod) and field.ty.intInfo(mod).bits >= 128) {
                             // The C ABI requires 128 bit integer fields of structs
                             // to be 16-bytes aligned.
                             big_align = @max(big_align, 16);
@@ -3149,7 +3235,7 @@ pub const Type = extern union {
                     if (val.tag() != .unreachable_value) continue; // comptime field
                     if (!(field_ty.hasRuntimeBits())) continue;
 
-                    switch (try field_ty.abiAlignmentAdvanced(target, strat)) {
+                    switch (try field_ty.abiAlignmentAdvanced(mod, strat)) {
                         .scalar => |field_align| big_align = @max(big_align, field_align),
                         .val => switch (strat) {
                             .eager => unreachable, // field type alignment not resolved
@@ -3162,9 +3248,8 @@ pub const Type = extern union {
             },
 
             .enum_full, .enum_nonexhaustive, .enum_simple, .enum_numbered => {
-                var buffer: Payload.Bits = undefined;
-                const int_tag_ty = ty.intTagType(&buffer);
-                return AbiAlignmentAdvanced{ .scalar = int_tag_ty.abiAlignment(target) };
+                const int_tag_ty = ty.intTagType();
+                return AbiAlignmentAdvanced{ .scalar = int_tag_ty.abiAlignment(mod) };
             },
             .@"union" => {
                 const union_obj = ty.castTag(.@"union").?.data;
@@ -3200,7 +3285,7 @@ pub const Type = extern union {
 
     pub fn abiAlignmentAdvancedUnion(
         ty: Type,
-        target: Target,
+        mod: *const Module,
         strat: AbiAlignmentAdvancedStrat,
         union_obj: *Module.Union,
         have_tag: bool,
@@ -3214,6 +3299,7 @@ pub const Type = extern union {
                 // We'll guess "pointer-aligned", if the union has an
                 // underaligned pointer field then some allocations
                 // might require explicit alignment.
+                const target = mod.getTarget();
                 return AbiAlignmentAdvanced{ .scalar = @divExact(target.cpu.arch.ptrBitWidth(), 8) };
             }
             _ = try sema.resolveTypeFields(ty);
@@ -3225,23 +3311,23 @@ pub const Type = extern union {
         };
         if (union_obj.fields.count() == 0) {
             if (have_tag) {
-                return abiAlignmentAdvanced(union_obj.tag_ty, target, strat);
+                return abiAlignmentAdvanced(union_obj.tag_ty, mod, strat);
             } else {
                 return AbiAlignmentAdvanced{ .scalar = @boolToInt(union_obj.layout == .Extern) };
             }
         }
 
         var max_align: u32 = 0;
-        if (have_tag) max_align = union_obj.tag_ty.abiAlignment(target);
+        if (have_tag) max_align = union_obj.tag_ty.abiAlignment(mod);
         for (union_obj.fields.values()) |field| {
-            if (!(field.ty.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+            if (!(field.ty.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                 error.NeedLazy => return AbiAlignmentAdvanced{ .val = try Value.Tag.lazy_align.create(strat.lazy, ty) },
                 else => |e| return e,
             })) continue;
 
             const field_align = if (field.abi_align != 0)
                 field.abi_align
-            else switch (try field.ty.abiAlignmentAdvanced(target, strat)) {
+            else switch (try field.ty.abiAlignmentAdvanced(mod, strat)) {
                 .scalar => |a| a,
                 .val => switch (strat) {
                     .eager => unreachable, // struct layout not resolved
@@ -3264,8 +3350,8 @@ pub const Type = extern union {
 
     /// Asserts the type has the ABI size already resolved.
     /// Types that return false for hasRuntimeBits() return 0.
-    pub fn abiSize(ty: Type, target: Target) u64 {
-        return (abiSizeAdvanced(ty, target, .eager) catch unreachable).scalar;
+    pub fn abiSize(ty: Type, mod: *const Module) u64 {
+        return (abiSizeAdvanced(ty, mod, .eager) catch unreachable).scalar;
     }
 
     const AbiSizeAdvanced = union(enum) {
@@ -3281,14 +3367,29 @@ pub const Type = extern union {
     /// necessary, possibly returning a CompileError.
     pub fn abiSizeAdvanced(
         ty: Type,
-        target: Target,
+        mod: *const Module,
         strat: AbiAlignmentAdvancedStrat,
     ) Module.CompileError!AbiSizeAdvanced {
+        const target = mod.getTarget();
+
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| {
+                if (int_type.bits == 0) return AbiSizeAdvanced{ .scalar = 0 };
+                return AbiSizeAdvanced{ .scalar = intAbiSize(int_type.bits, target) };
+            },
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         switch (ty.tag()) {
-            .fn_noreturn_no_args => unreachable, // represents machine code; not a pointer
-            .fn_void_no_args => unreachable, // represents machine code; not a pointer
-            .fn_naked_noreturn_no_args => unreachable, // represents machine code; not a pointer
-            .fn_ccc_void_no_args => unreachable, // represents machine code; not a pointer
             .function => unreachable, // represents machine code; not a pointer
             .@"opaque" => unreachable, // no size available
             .bound_fn => unreachable,
@@ -3329,7 +3430,7 @@ pub const Type = extern union {
                         .eager => {},
                     }
                     assert(struct_obj.haveLayout());
-                    return AbiSizeAdvanced{ .scalar = struct_obj.backing_int_ty.abiSize(target) };
+                    return AbiSizeAdvanced{ .scalar = struct_obj.backing_int_ty.abiSize(mod) };
                 },
                 else => {
                     switch (strat) {
@@ -3348,14 +3449,13 @@ pub const Type = extern union {
                     if (field_count == 0) {
                         return AbiSizeAdvanced{ .scalar = 0 };
                     }
-                    return AbiSizeAdvanced{ .scalar = ty.structFieldOffset(field_count, target) };
+                    return AbiSizeAdvanced{ .scalar = ty.structFieldOffset(field_count, mod) };
                 },
             },
 
             .enum_simple, .enum_full, .enum_nonexhaustive, .enum_numbered => {
-                var buffer: Payload.Bits = undefined;
-                const int_tag_ty = ty.intTagType(&buffer);
-                return AbiSizeAdvanced{ .scalar = int_tag_ty.abiSize(target) };
+                const int_tag_ty = ty.intTagType();
+                return AbiSizeAdvanced{ .scalar = int_tag_ty.abiSize(mod) };
             },
             .@"union" => {
                 const union_obj = ty.castTag(.@"union").?.data;
@@ -3412,10 +3512,10 @@ pub const Type = extern union {
                         .val = try Value.Tag.lazy_size.create(arena, ty),
                     },
                 };
-                const elem_bits = try payload.elem_type.bitSizeAdvanced(target, opt_sema);
+                const elem_bits = try payload.elem_type.bitSizeAdvanced(mod, opt_sema);
                 const total_bits = elem_bits * payload.len;
                 const total_bytes = (total_bits + 7) / 8;
-                const alignment = switch (try ty.abiAlignmentAdvanced(target, strat)) {
+                const alignment = switch (try ty.abiAlignmentAdvanced(mod, strat)) {
                     .scalar => |x| x,
                     .val => return AbiSizeAdvanced{
                         .val = try Value.Tag.lazy_size.create(strat.lazy, ty),
@@ -3476,7 +3576,7 @@ pub const Type = extern union {
                         .data = 80,
                     };
                     const u80_ty = initPayload(&payload.base);
-                    return AbiSizeAdvanced{ .scalar = abiSize(u80_ty, target) };
+                    return AbiSizeAdvanced{ .scalar = abiSize(u80_ty, mod) };
                 },
             },
 
@@ -3494,11 +3594,6 @@ pub const Type = extern union {
             .i32, .u32 => return AbiSizeAdvanced{ .scalar = intAbiSize(32, target) },
             .i64, .u64 => return AbiSizeAdvanced{ .scalar = intAbiSize(64, target) },
             .u128, .i128 => return AbiSizeAdvanced{ .scalar = intAbiSize(128, target) },
-            .int_signed, .int_unsigned => {
-                const bits: u16 = ty.cast(Payload.Bits).?.data;
-                if (bits == 0) return AbiSizeAdvanced{ .scalar = 0 };
-                return AbiSizeAdvanced{ .scalar = intAbiSize(bits, target) };
-            },
 
             .optional => {
                 var buf: Payload.ElemType = undefined;
@@ -3508,12 +3603,12 @@ pub const Type = extern union {
                     return AbiSizeAdvanced{ .scalar = 0 };
                 }
 
-                if (!(child_type.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+                if (!(child_type.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                     error.NeedLazy => return AbiSizeAdvanced{ .val = try Value.Tag.lazy_size.create(strat.lazy, ty) },
                     else => |e| return e,
                 })) return AbiSizeAdvanced{ .scalar = 1 };
 
-                if (ty.optionalReprIsPayload()) {
+                if (ty.optionalReprIsPayload(mod)) {
                     return abiSizeAdvanced(child_type, target, strat);
                 }
 
@@ -3531,7 +3626,7 @@ pub const Type = extern union {
                 // guaranteed to be >= that of bool's (1 byte) the added size is exactly equal
                 // to the child type's ABI alignment.
                 return AbiSizeAdvanced{
-                    .scalar = child_type.abiAlignment(target) + payload_size,
+                    .scalar = child_type.abiAlignment(mod) + payload_size,
                 };
             },
 
@@ -3539,16 +3634,16 @@ pub const Type = extern union {
                 // This code needs to be kept in sync with the equivalent switch prong
                 // in abiAlignmentAdvanced.
                 const data = ty.castTag(.error_union).?.data;
-                const code_size = abiSize(Type.anyerror, target);
-                if (!(data.payload.hasRuntimeBitsAdvanced(false, strat) catch |err| switch (err) {
+                const code_size = abiSize(Type.anyerror, mod);
+                if (!(data.payload.hasRuntimeBitsAdvanced(mod, false, strat) catch |err| switch (err) {
                     error.NeedLazy => return AbiSizeAdvanced{ .val = try Value.Tag.lazy_size.create(strat.lazy, ty) },
                     else => |e| return e,
                 })) {
                     // Same as anyerror.
                     return AbiSizeAdvanced{ .scalar = code_size };
                 }
-                const code_align = abiAlignment(Type.anyerror, target);
-                const payload_align = abiAlignment(data.payload, target);
+                const code_align = abiAlignment(Type.anyerror, mod);
+                const payload_align = abiAlignment(data.payload, mod);
                 const payload_size = switch (try data.payload.abiSizeAdvanced(target, strat)) {
                     .scalar => |elem_size| elem_size,
                     .val => switch (strat) {
@@ -3577,7 +3672,7 @@ pub const Type = extern union {
 
     pub fn abiSizeAdvancedUnion(
         ty: Type,
-        target: Target,
+        mod: *const Module,
         strat: AbiAlignmentAdvancedStrat,
         union_obj: *Module.Union,
         have_tag: bool,
@@ -3591,7 +3686,7 @@ pub const Type = extern union {
             },
             .eager => {},
         }
-        return AbiSizeAdvanced{ .scalar = union_obj.abiSize(target, have_tag) };
+        return AbiSizeAdvanced{ .scalar = union_obj.abiSize(mod, have_tag) };
     }
 
     fn intAbiSize(bits: u16, target: Target) u64 {
@@ -3606,8 +3701,8 @@ pub const Type = extern union {
         );
     }
 
-    pub fn bitSize(ty: Type, target: Target) u64 {
-        return bitSizeAdvanced(ty, target, null) catch unreachable;
+    pub fn bitSize(ty: Type, mod: *const Module) u64 {
+        return bitSizeAdvanced(ty, mod, null) catch unreachable;
     }
 
     /// If you pass `opt_sema`, any recursive type resolutions will happen if
@@ -3615,15 +3710,28 @@ pub const Type = extern union {
     /// the type is fully resolved, and there will be no error, guaranteed.
     pub fn bitSizeAdvanced(
         ty: Type,
-        target: Target,
+        mod: *const Module,
         opt_sema: ?*Sema,
     ) Module.CompileError!u64 {
+        const target = mod.getTarget();
+
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| return int_type.bits,
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         const strat: AbiAlignmentAdvancedStrat = if (opt_sema) |sema| .{ .sema = sema } else .eager;
+
         switch (ty.tag()) {
-            .fn_noreturn_no_args => unreachable, // represents machine code; not a pointer
-            .fn_void_no_args => unreachable, // represents machine code; not a pointer
-            .fn_naked_noreturn_no_args => unreachable, // represents machine code; not a pointer
-            .fn_ccc_void_no_args => unreachable, // represents machine code; not a pointer
             .function => unreachable, // represents machine code; not a pointer
             .anyopaque => unreachable,
             .type => unreachable,
@@ -3660,7 +3768,7 @@ pub const Type = extern union {
                 }
                 if (opt_sema) |sema| _ = try sema.resolveTypeLayout(ty);
                 assert(struct_obj.haveLayout());
-                return try struct_obj.backing_int_ty.bitSizeAdvanced(target, opt_sema);
+                return try struct_obj.backing_int_ty.bitSizeAdvanced(mod, opt_sema);
             },
 
             .tuple, .anon_struct => {
@@ -3670,15 +3778,14 @@ pub const Type = extern union {
                 }
                 var total: u64 = 0;
                 for (ty.tupleFields().types) |field_ty| {
-                    total += try bitSizeAdvanced(field_ty, target, opt_sema);
+                    total += try bitSizeAdvanced(field_ty, mod, opt_sema);
                 }
                 return total;
             },
 
             .enum_simple, .enum_full, .enum_nonexhaustive, .enum_numbered => {
-                var buffer: Payload.Bits = undefined;
-                const int_tag_ty = ty.intTagType(&buffer);
-                return try bitSizeAdvanced(int_tag_ty, target, opt_sema);
+                const int_tag_ty = ty.intTagType();
+                return try bitSizeAdvanced(int_tag_ty, mod, opt_sema);
             },
 
             .@"union", .union_safety_tagged, .union_tagged => {
@@ -3691,33 +3798,33 @@ pub const Type = extern union {
 
                 var size: u64 = 0;
                 for (union_obj.fields.values()) |field| {
-                    size = @max(size, try bitSizeAdvanced(field.ty, target, opt_sema));
+                    size = @max(size, try bitSizeAdvanced(field.ty, mod, opt_sema));
                 }
                 return size;
             },
 
             .vector => {
                 const payload = ty.castTag(.vector).?.data;
-                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, target, opt_sema);
+                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, mod, opt_sema);
                 return elem_bit_size * payload.len;
             },
             .array_u8 => return 8 * ty.castTag(.array_u8).?.data,
             .array_u8_sentinel_0 => return 8 * (ty.castTag(.array_u8_sentinel_0).?.data + 1),
             .array => {
                 const payload = ty.castTag(.array).?.data;
-                const elem_size = std.math.max(payload.elem_type.abiAlignment(target), payload.elem_type.abiSize(target));
+                const elem_size = std.math.max(payload.elem_type.abiAlignment(mod), payload.elem_type.abiSize(mod));
                 if (elem_size == 0 or payload.len == 0)
                     return @as(u64, 0);
-                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, target, opt_sema);
+                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, mod, opt_sema);
                 return (payload.len - 1) * 8 * elem_size + elem_bit_size;
             },
             .array_sentinel => {
                 const payload = ty.castTag(.array_sentinel).?.data;
                 const elem_size = std.math.max(
-                    payload.elem_type.abiAlignment(target),
-                    payload.elem_type.abiSize(target),
+                    payload.elem_type.abiAlignment(mod),
+                    payload.elem_type.abiSize(mod),
                 );
-                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, target, opt_sema);
+                const elem_bit_size = try bitSizeAdvanced(payload.elem_type, mod, opt_sema);
                 return payload.len * 8 * elem_size + elem_bit_size;
             },
 
@@ -3780,8 +3887,6 @@ pub const Type = extern union {
             .error_set_merged,
             => return 16, // TODO revisit this when we have the concept of the error tag type
 
-            .int_signed, .int_unsigned => return ty.cast(Payload.Bits).?.data,
-
             .optional, .error_union => {
                 // Optionals and error unions are not packed so their bitsize
                 // includes padding bits.
@@ -3805,8 +3910,8 @@ pub const Type = extern union {
 
     /// Returns true if the type's layout is already resolved and it is safe
     /// to use `abiSize`, `abiAlignment` and `bitSize` on it.
-    pub fn layoutIsResolved(ty: Type) bool {
-        switch (ty.zigTypeTag()) {
+    pub fn layoutIsResolved(ty: Type, mod: *const Module) bool {
+        switch (ty.zigTypeTag(mod)) {
             .Struct => {
                 if (ty.castTag(.@"struct")) |struct_ty| {
                     return struct_ty.data.haveLayout();
@@ -4017,13 +4122,13 @@ pub const Type = extern union {
         };
     }
 
-    pub fn isAllowzeroPtr(self: Type) bool {
+    pub fn isAllowzeroPtr(self: Type, mod: *const Module) bool {
         return switch (self.tag()) {
             .pointer => {
                 const payload = self.castTag(.pointer).?.data;
                 return payload.@"allowzero";
             },
-            else => return self.zigTypeTag() == .Optional,
+            else => return self.zigTypeTag(mod) == .Optional,
         };
     }
 
@@ -4039,7 +4144,7 @@ pub const Type = extern union {
         };
     }
 
-    pub fn isPtrAtRuntime(self: Type) bool {
+    pub fn isPtrAtRuntime(self: Type, mod: *const Module) bool {
         switch (self.tag()) {
             .c_const_pointer,
             .c_mut_pointer,
@@ -4063,7 +4168,7 @@ pub const Type = extern union {
             .optional => {
                 var buf: Payload.ElemType = undefined;
                 const child_type = self.optionalChild(&buf);
-                if (child_type.zigTypeTag() != .Pointer) return false;
+                if (child_type.zigTypeTag(mod) != .Pointer) return false;
                 const info = child_type.ptrInfo().data;
                 switch (info.size) {
                     .Slice, .C => return false,
@@ -4077,15 +4182,15 @@ pub const Type = extern union {
 
     /// For pointer-like optionals, returns true, otherwise returns the allowzero property
     /// of pointers.
-    pub fn ptrAllowsZero(ty: Type) bool {
-        if (ty.isPtrLikeOptional()) {
+    pub fn ptrAllowsZero(ty: Type, mod: *const Module) bool {
+        if (ty.isPtrLikeOptional(mod)) {
             return true;
         }
         return ty.ptrInfo().data.@"allowzero";
     }
 
     /// See also `isPtrLikeOptional`.
-    pub fn optionalReprIsPayload(ty: Type) bool {
+    pub fn optionalReprIsPayload(ty: Type, mod: *const Module) bool {
         switch (ty.tag()) {
             .optional_single_const_pointer,
             .optional_single_mut_pointer,
@@ -4095,7 +4200,7 @@ pub const Type = extern union {
 
             .optional => {
                 const child_ty = ty.castTag(.optional).?.data;
-                switch (child_ty.zigTypeTag()) {
+                switch (child_ty.zigTypeTag(mod)) {
                     .Pointer => {
                         const info = child_ty.ptrInfo().data;
                         switch (info.size) {
@@ -4116,7 +4221,7 @@ pub const Type = extern union {
 
     /// Returns true if the type is optional and would be lowered to a single pointer
     /// address value, using 0 for null. Note that this returns true for C pointers.
-    pub fn isPtrLikeOptional(self: Type) bool {
+    pub fn isPtrLikeOptional(self: Type, mod: *const Module) bool {
         switch (self.tag()) {
             .optional_single_const_pointer,
             .optional_single_mut_pointer,
@@ -4126,7 +4231,7 @@ pub const Type = extern union {
 
             .optional => {
                 const child_ty = self.castTag(.optional).?.data;
-                if (child_ty.zigTypeTag() != .Pointer) return false;
+                if (child_ty.zigTypeTag(mod) != .Pointer) return false;
                 const info = child_ty.ptrInfo().data;
                 switch (info.size) {
                     .Slice, .C => return false,
@@ -4238,16 +4343,16 @@ pub const Type = extern union {
         };
     }
 
-    fn shallowElemType(child_ty: Type) Type {
-        return switch (child_ty.zigTypeTag()) {
+    fn shallowElemType(child_ty: Type, mod: *const Module) Type {
+        return switch (child_ty.zigTypeTag(mod)) {
             .Array, .Vector => child_ty.childType(),
             else => child_ty,
         };
     }
 
     /// For vectors, returns the element type. Otherwise returns self.
-    pub fn scalarType(ty: Type) Type {
-        return switch (ty.zigTypeTag()) {
+    pub fn scalarType(ty: Type, mod: *const Module) Type {
+        return switch (ty.zigTypeTag(mod)) {
             .Vector => ty.childType(),
             else => ty,
         };
@@ -4466,8 +4571,8 @@ pub const Type = extern union {
         };
     }
 
-    pub fn isError(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isError(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .ErrorUnion, .ErrorSet => true,
             else => false,
         };
@@ -4573,9 +4678,16 @@ pub const Type = extern union {
     }
 
     /// Returns true if and only if the type is a fixed-width, signed integer.
-    pub fn isSignedInt(self: Type) bool {
-        return switch (self.tag()) {
-            .int_signed,
+    pub fn isSignedInt(ty: Type, mod: *const Module) bool {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| return int_type.signedness == .signed,
+            .simple_type => |s| return switch (s) {
+                isize, c_short, c_int, c_long, c_longlong => true,
+                else => false,
+            },
+            else => return false,
+        };
+        return switch (ty.tag()) {
             .i8,
             .isize,
             .c_char,
@@ -4594,9 +4706,16 @@ pub const Type = extern union {
     }
 
     /// Returns true if and only if the type is a fixed-width, unsigned integer.
-    pub fn isUnsignedInt(self: Type) bool {
-        return switch (self.tag()) {
-            .int_unsigned,
+    pub fn isUnsignedInt(ty: Type, mod: *const Module) bool {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| return int_type.signedness == .unsigned,
+            .simple_type => |s| return switch (s) {
+                usize, c_ushort, c_uint, c_ulong, c_ulonglong => true,
+                else => false,
+            },
+            else => return false,
+        };
+        return switch (ty.tag()) {
             .usize,
             .c_ushort,
             .c_uint,
@@ -4617,8 +4736,8 @@ pub const Type = extern union {
 
     /// Returns true for integers, enums, error sets, and packed structs.
     /// If this function returns true, then intInfo() can be called on the type.
-    pub fn isAbiInt(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isAbiInt(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Int, .Enum, .ErrorSet => true,
             .Struct => ty.containerLayout() == .Packed,
             else => false,
@@ -4626,17 +4745,25 @@ pub const Type = extern union {
     }
 
     /// Asserts the type is an integer, enum, error set, or vector of one of them.
-    pub fn intInfo(self: Type, target: Target) std.builtin.Type.Int {
-        var ty = self;
+    pub fn intInfo(starting_ty: Type, mod: *const Module) InternPool.Key.IntType {
+        const target = mod.getTarget();
+        var ty = starting_ty;
+
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| return int_type,
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         while (true) switch (ty.tag()) {
-            .int_unsigned => return .{
-                .signedness = .unsigned,
-                .bits = ty.castTag(.int_unsigned).?.data,
-            },
-            .int_signed => return .{
-                .signedness = .signed,
-                .bits = ty.castTag(.int_signed).?.data,
-            },
             .u1 => return .{ .signedness = .unsigned, .bits = 1 },
             .u8 => return .{ .signedness = .unsigned, .bits = 8 },
             .i8 => return .{ .signedness = .signed, .bits = 8 },
@@ -4754,32 +4881,14 @@ pub const Type = extern union {
 
     /// Asserts the type is a function.
     pub fn fnParamLen(self: Type) usize {
-        return switch (self.tag()) {
-            .fn_noreturn_no_args => 0,
-            .fn_void_no_args => 0,
-            .fn_naked_noreturn_no_args => 0,
-            .fn_ccc_void_no_args => 0,
-            .function => self.castTag(.function).?.data.param_types.len,
-
-            else => unreachable,
-        };
+        return self.castTag(.function).?.data.param_types.len;
     }
 
     /// Asserts the type is a function. The length of the slice must be at least the length
     /// given by `fnParamLen`.
     pub fn fnParamTypes(self: Type, types: []Type) void {
-        switch (self.tag()) {
-            .fn_noreturn_no_args => return,
-            .fn_void_no_args => return,
-            .fn_naked_noreturn_no_args => return,
-            .fn_ccc_void_no_args => return,
-            .function => {
-                const payload = self.castTag(.function).?.data;
-                @memcpy(types[0..payload.param_types.len], payload.param_types);
-            },
-
-            else => unreachable,
-        }
+        const payload = self.castTag(.function).?.data;
+        @memcpy(types[0..payload.param_types.len], payload.param_types);
     }
 
     /// Asserts the type is a function.
@@ -4794,33 +4903,15 @@ pub const Type = extern union {
         }
     }
 
-    /// Asserts the type is a function.
-    pub fn fnReturnType(self: Type) Type {
-        return switch (self.tag()) {
-            .fn_noreturn_no_args => Type.initTag(.noreturn),
-            .fn_naked_noreturn_no_args => Type.initTag(.noreturn),
-
-            .fn_void_no_args,
-            .fn_ccc_void_no_args,
-            => Type.initTag(.void),
-
-            .function => self.castTag(.function).?.data.return_type,
-
-            else => unreachable,
-        };
+    /// Asserts the type is a function or a function pointer.
+    pub fn fnReturnType(ty: Type) Type {
+        const fn_ty = if (ty.castPointer()) |p| p.data else ty;
+        return fn_ty.castTag(.function).?.data.return_type;
     }
 
     /// Asserts the type is a function.
     pub fn fnCallingConvention(self: Type) std.builtin.CallingConvention {
-        return switch (self.tag()) {
-            .fn_noreturn_no_args => .Unspecified,
-            .fn_void_no_args => .Unspecified,
-            .fn_naked_noreturn_no_args => .Naked,
-            .fn_ccc_void_no_args => .C,
-            .function => self.castTag(.function).?.data.cc,
-
-            else => unreachable,
-        };
+        return self.castTag(.function).?.data.cc;
     }
 
     /// Asserts the type is a function.
@@ -4850,87 +4941,43 @@ pub const Type = extern union {
 
     /// Asserts the type is a function.
     pub fn fnIsVarArgs(self: Type) bool {
-        return switch (self.tag()) {
-            .fn_noreturn_no_args => false,
-            .fn_void_no_args => false,
-            .fn_naked_noreturn_no_args => false,
-            .fn_ccc_void_no_args => false,
-            .function => self.castTag(.function).?.data.is_var_args,
-
-            else => unreachable,
-        };
+        return self.castTag(.function).?.data.is_var_args;
     }
 
     pub fn fnInfo(ty: Type) Payload.Function.Data {
-        return switch (ty.tag()) {
-            .fn_noreturn_no_args => .{
-                .param_types = &.{},
-                .comptime_params = undefined,
-                .return_type = initTag(.noreturn),
-                .cc = .Unspecified,
-                .alignment = 0,
-                .is_var_args = false,
-                .is_generic = false,
-                .is_noinline = false,
-                .align_is_generic = false,
-                .cc_is_generic = false,
-                .section_is_generic = false,
-                .addrspace_is_generic = false,
-                .noalias_bits = 0,
-            },
-            .fn_void_no_args => .{
-                .param_types = &.{},
-                .comptime_params = undefined,
-                .return_type = initTag(.void),
-                .cc = .Unspecified,
-                .alignment = 0,
-                .is_var_args = false,
-                .is_generic = false,
-                .is_noinline = false,
-                .align_is_generic = false,
-                .cc_is_generic = false,
-                .section_is_generic = false,
-                .addrspace_is_generic = false,
-                .noalias_bits = 0,
-            },
-            .fn_naked_noreturn_no_args => .{
-                .param_types = &.{},
-                .comptime_params = undefined,
-                .return_type = initTag(.noreturn),
-                .cc = .Naked,
-                .alignment = 0,
-                .is_var_args = false,
-                .is_generic = false,
-                .is_noinline = false,
-                .align_is_generic = false,
-                .cc_is_generic = false,
-                .section_is_generic = false,
-                .addrspace_is_generic = false,
-                .noalias_bits = 0,
-            },
-            .fn_ccc_void_no_args => .{
-                .param_types = &.{},
-                .comptime_params = undefined,
-                .return_type = initTag(.void),
-                .cc = .C,
-                .alignment = 0,
-                .is_var_args = false,
-                .is_generic = false,
-                .is_noinline = false,
-                .align_is_generic = false,
-                .cc_is_generic = false,
-                .section_is_generic = false,
-                .addrspace_is_generic = false,
-                .noalias_bits = 0,
-            },
-            .function => ty.castTag(.function).?.data,
-
-            else => unreachable,
-        };
+        return ty.castTag(.function).?.data;
     }
 
-    pub fn isNumeric(self: Type) bool {
-        return switch (self.tag()) {
+    pub fn isNumeric(ty: Type, mod: *const Module) bool {
+        const ip_tags = mod.intern_pool.items.items(.tag);
+        if (ty.ip_index != .none) return switch (ip_tags[ty.ip_index]) {
+            .int_type => true,
+            .simple_type => |s| return switch (s) {
+                .f16,
+                .f32,
+                .f64,
+                .f80,
+                .f128,
+                .c_longdouble,
+                .comptime_int,
+                .comptime_float,
+                .usize,
+                .isize,
+                .c_short,
+                .c_ushort,
+                .c_int,
+                .c_uint,
+                .c_long,
+                .c_ulong,
+                .c_longlong,
+                .c_ulonglong,
+                => true,
+
+                else => false,
+            },
+            else => false,
+        };
+        return switch (ty.tag()) {
             .f16,
             .f32,
             .f64,
@@ -4962,8 +5009,6 @@ pub const Type = extern union {
             .c_ulong,
             .c_longlong,
             .c_ulonglong,
-            .int_unsigned,
-            .int_signed,
             => true,
 
             else => false,
@@ -4972,8 +5017,29 @@ pub const Type = extern union {
 
     /// During semantic analysis, instead call `Sema.typeHasOnePossibleValue` which
     /// resolves field types rather than asserting they are already resolved.
-    pub fn onePossibleValue(starting_type: Type) ?Value {
+    pub fn onePossibleValue(starting_type: Type, mod: *const Module) ?Value {
         var ty = starting_type;
+
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => |int_type| {
+                if (int_type.bits == 0) {
+                    return Value.zero;
+                } else {
+                    return null;
+                }
+            },
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         while (true) switch (ty.tag()) {
             .f16,
             .f32,
@@ -5013,10 +5079,6 @@ pub const Type = extern union {
             .error_set_single,
             .error_set,
             .error_set_merged,
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
             .function,
             .single_const_pointer_to_comptime_int,
             .array_sentinel,
@@ -5074,7 +5136,7 @@ pub const Type = extern union {
                 assert(s.haveFieldTypes());
                 for (s.fields.values()) |field| {
                     if (field.is_comptime) continue;
-                    if (field.ty.onePossibleValue() != null) continue;
+                    if (field.ty.onePossibleValue(mod) != null) continue;
                     return null;
                 }
                 return Value.initTag(.empty_struct_value);
@@ -5085,7 +5147,7 @@ pub const Type = extern union {
                 for (tuple.values, 0..) |val, i| {
                     const is_comptime = val.tag() != .unreachable_value;
                     if (is_comptime) continue;
-                    if (tuple.types[i].onePossibleValue() != null) continue;
+                    if (tuple.types[i].onePossibleValue(mod) != null) continue;
                     return null;
                 }
                 return Value.initTag(.empty_struct_value);
@@ -5094,7 +5156,7 @@ pub const Type = extern union {
             .enum_numbered => {
                 const enum_numbered = ty.castTag(.enum_numbered).?.data;
                 // An explicit tag type is always provided for enum_numbered.
-                if (enum_numbered.tag_ty.hasRuntimeBits()) {
+                if (enum_numbered.tag_ty.hasRuntimeBits(mod)) {
                     return null;
                 }
                 assert(enum_numbered.fields.count() == 1);
@@ -5102,7 +5164,7 @@ pub const Type = extern union {
             },
             .enum_full => {
                 const enum_full = ty.castTag(.enum_full).?.data;
-                if (enum_full.tag_ty.hasRuntimeBits()) {
+                if (enum_full.tag_ty.hasRuntimeBits(mod)) {
                     return null;
                 }
                 switch (enum_full.fields.count()) {
@@ -5125,7 +5187,7 @@ pub const Type = extern union {
             },
             .enum_nonexhaustive => {
                 const tag_ty = ty.castTag(.enum_nonexhaustive).?.data.tag_ty;
-                if (!tag_ty.hasRuntimeBits()) {
+                if (!tag_ty.hasRuntimeBits(mod)) {
                     return Value.zero;
                 } else {
                     return null;
@@ -5133,10 +5195,10 @@ pub const Type = extern union {
             },
             .@"union", .union_safety_tagged, .union_tagged => {
                 const union_obj = ty.cast(Payload.Union).?.data;
-                const tag_val = union_obj.tag_ty.onePossibleValue() orelse return null;
+                const tag_val = union_obj.tag_ty.onePossibleValue(mod) orelse return null;
                 if (union_obj.fields.count() == 0) return Value.initTag(.unreachable_value);
                 const only_field = union_obj.fields.values()[0];
-                const val_val = only_field.ty.onePossibleValue() orelse return null;
+                const val_val = only_field.ty.onePossibleValue(mod) orelse return null;
                 _ = tag_val;
                 _ = val_val;
                 return Value.initTag(.empty_struct_value);
@@ -5148,17 +5210,10 @@ pub const Type = extern union {
             .null => return Value.initTag(.null_value),
             .undefined => return Value.initTag(.undef),
 
-            .int_unsigned, .int_signed => {
-                if (ty.cast(Payload.Bits).?.data == 0) {
-                    return Value.zero;
-                } else {
-                    return null;
-                }
-            },
             .vector, .array, .array_u8 => {
                 if (ty.arrayLen() == 0)
                     return Value.initTag(.empty_array);
-                if (ty.elemType().onePossibleValue() != null)
+                if (ty.elemType().onePossibleValue(mod) != null)
                     return Value.initTag(.the_only_possible_value);
                 return null;
             },
@@ -5173,7 +5228,21 @@ pub const Type = extern union {
     /// resolves field types rather than asserting they are already resolved.
     /// TODO merge these implementations together with the "advanced" pattern seen
     /// elsewhere in this file.
-    pub fn comptimeOnly(ty: Type) bool {
+    pub fn comptimeOnly(ty: Type, mod: *const Module) bool {
+        if (ty.ip_index != .none) switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+            .int_type => return false,
+            .ptr_type => @panic("TODO"),
+            .array_type => @panic("TODO"),
+            .vector_type => @panic("TODO"),
+            .optional_type => @panic("TODO"),
+            .error_union_type => @panic("TODO"),
+            .simple_type => @panic("TODO"),
+            .simple_value => unreachable,
+            .extern_func => unreachable,
+            .int => unreachable,
+            .enum_tag => unreachable, // it's a value, not a type
+        };
+
         return switch (ty.tag()) {
             .u1,
             .u8,
@@ -5238,8 +5307,6 @@ pub const Type = extern union {
             .generic_poison,
             .array_u8,
             .array_u8_sentinel_0,
-            .int_signed,
-            .int_unsigned,
             .enum_simple,
             => false,
 
@@ -5250,10 +5317,6 @@ pub const Type = extern union {
             .enum_literal,
             .type_info,
             // These are function bodies, not function pointers.
-            .fn_noreturn_no_args,
-            .fn_void_no_args,
-            .fn_naked_noreturn_no_args,
-            .fn_ccc_void_no_args,
             .function,
             => true,
 
@@ -5265,7 +5328,7 @@ pub const Type = extern union {
             .array,
             .array_sentinel,
             .vector,
-            => return ty.childType().comptimeOnly(),
+            => return ty.childType().comptimeOnly(mod),
 
             .pointer,
             .single_const_pointer,
@@ -5278,10 +5341,10 @@ pub const Type = extern union {
             .mut_slice,
             => {
                 const child_ty = ty.childType();
-                if (child_ty.zigTypeTag() == .Fn) {
+                if (child_ty.zigTypeTag(mod) == .Fn) {
                     return false;
                 } else {
-                    return child_ty.comptimeOnly();
+                    return child_ty.comptimeOnly(mod);
                 }
             },
 
@@ -5290,14 +5353,14 @@ pub const Type = extern union {
             .optional_single_const_pointer,
             => {
                 var buf: Type.Payload.ElemType = undefined;
-                return ty.optionalChild(&buf).comptimeOnly();
+                return ty.optionalChild(&buf).comptimeOnly(mod);
             },
 
             .tuple, .anon_struct => {
                 const tuple = ty.tupleFields();
                 for (tuple.types, 0..) |field_ty, i| {
                     const have_comptime_val = tuple.values[i].tag() != .unreachable_value;
-                    if (!have_comptime_val and field_ty.comptimeOnly()) return true;
+                    if (!have_comptime_val and field_ty.comptimeOnly(mod)) return true;
                 }
                 return false;
             },
@@ -5330,48 +5393,48 @@ pub const Type = extern union {
                 }
             },
 
-            .error_union => return ty.errorUnionPayload().comptimeOnly(),
+            .error_union => return ty.errorUnionPayload().comptimeOnly(mod),
             .anyframe_T => {
                 const child_ty = ty.castTag(.anyframe_T).?.data;
-                return child_ty.comptimeOnly();
+                return child_ty.comptimeOnly(mod);
             },
             .enum_numbered => {
                 const tag_ty = ty.castTag(.enum_numbered).?.data.tag_ty;
-                return tag_ty.comptimeOnly();
+                return tag_ty.comptimeOnly(mod);
             },
             .enum_full, .enum_nonexhaustive => {
                 const tag_ty = ty.cast(Type.Payload.EnumFull).?.data.tag_ty;
-                return tag_ty.comptimeOnly();
+                return tag_ty.comptimeOnly(mod);
             },
         };
     }
 
-    pub fn isArrayOrVector(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isArrayOrVector(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Array, .Vector => true,
             else => false,
         };
     }
 
-    pub fn isIndexable(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn isIndexable(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Array, .Vector => true,
             .Pointer => switch (ty.ptrSize()) {
                 .Slice, .Many, .C => true,
-                .One => ty.elemType().zigTypeTag() == .Array,
+                .One => ty.elemType().zigTypeTag(mod) == .Array,
             },
             .Struct => ty.isTuple(),
             else => false,
         };
     }
 
-    pub fn indexableHasLen(ty: Type) bool {
-        return switch (ty.zigTypeTag()) {
+    pub fn indexableHasLen(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
             .Array, .Vector => true,
             .Pointer => switch (ty.ptrSize()) {
                 .Many, .C => false,
                 .Slice => true,
-                .One => ty.elemType().zigTypeTag() == .Array,
+                .One => ty.elemType().zigTypeTag(mod) == .Array,
             },
             .Struct => ty.isTuple(),
             else => false,
@@ -5395,19 +5458,19 @@ pub const Type = extern union {
     }
 
     // Works for vectors and vectors of integers.
-    pub fn minInt(ty: Type, arena: Allocator, target: Target) !Value {
-        const scalar = try minIntScalar(ty.scalarType(), arena, target);
-        if (ty.zigTypeTag() == .Vector and scalar.tag() != .the_only_possible_value) {
+    pub fn minInt(ty: Type, arena: Allocator, mod: *const Module) !Value {
+        const scalar = try minIntScalar(ty.scalarType(mod), arena, mod);
+        if (ty.zigTypeTag(mod) == .Vector and scalar.tag() != .the_only_possible_value) {
             return Value.Tag.repeated.create(arena, scalar);
         } else {
             return scalar;
         }
     }
 
-    /// Asserts that self.zigTypeTag() == .Int.
-    pub fn minIntScalar(ty: Type, arena: Allocator, target: Target) !Value {
-        assert(ty.zigTypeTag() == .Int);
-        const info = ty.intInfo(target);
+    /// Asserts that self.zigTypeTag(mod) == .Int.
+    pub fn minIntScalar(ty: Type, arena: Allocator, mod: *const Module) !Value {
+        assert(ty.zigTypeTag(mod) == .Int);
+        const info = ty.intInfo(mod);
 
         if (info.bits == 0) {
             return Value.initTag(.the_only_possible_value);
@@ -5433,10 +5496,10 @@ pub const Type = extern union {
         }
     }
 
-    /// Asserts that self.zigTypeTag() == .Int.
-    pub fn maxInt(self: Type, arena: Allocator, target: Target) !Value {
-        assert(self.zigTypeTag() == .Int);
-        const info = self.intInfo(target);
+    /// Asserts that self.zigTypeTag(mod) == .Int.
+    pub fn maxInt(self: Type, arena: Allocator, mod: *const Module) !Value {
+        assert(self.zigTypeTag(mod) == .Int);
+        const info = self.intInfo(mod);
 
         if (info.bits == 0) {
             return Value.initTag(.the_only_possible_value);
@@ -5471,21 +5534,25 @@ pub const Type = extern union {
     }
 
     /// Asserts the type is an enum or a union.
-    pub fn intTagType(ty: Type, buffer: *Payload.Bits) Type {
+    pub fn intTagType(ty: Type) Type {
         switch (ty.tag()) {
             .enum_full, .enum_nonexhaustive => return ty.cast(Payload.EnumFull).?.data.tag_ty,
             .enum_numbered => return ty.castTag(.enum_numbered).?.data.tag_ty,
             .enum_simple => {
-                const enum_simple = ty.castTag(.enum_simple).?.data;
-                const field_count = enum_simple.fields.count();
-                const bits: u16 = if (field_count == 0) 0 else std.math.log2_int_ceil(usize, field_count);
-                buffer.* = .{
-                    .base = .{ .tag = .int_unsigned },
-                    .data = bits,
-                };
-                return Type.initPayload(&buffer.base);
+                @panic("TODO move enum_simple to use the intern pool");
+                //const enum_simple = ty.castTag(.enum_simple).?.data;
+                //const field_count = enum_simple.fields.count();
+                //const bits: u16 = if (field_count == 0) 0 else std.math.log2_int_ceil(usize, field_count);
+                //buffer.* = .{
+                //    .base = .{ .tag = .int_unsigned },
+                //    .data = bits,
+                //};
+                //return Type.initPayload(&buffer.base);
             },
-            .union_tagged => return ty.castTag(.union_tagged).?.data.tag_ty.intTagType(buffer),
+            .union_tagged => {
+                @panic("TODO move union_tagged to use the intern pool");
+                //return ty.castTag(.union_tagged).?.data.tag_ty.intTagType(buffer),
+            },
             else => unreachable,
         }
     }
@@ -5585,7 +5652,7 @@ pub const Type = extern union {
                 };
                 const end_val = Value.initPayload(&end_payload.base);
                 if (int_val.compareAll(.gte, end_val, int_ty, m)) return null;
-                return @intCast(usize, int_val.toUnsignedInt(m.getTarget()));
+                return @intCast(usize, int_val.toUnsignedInt(m));
             }
         };
         switch (ty.tag()) {
@@ -5694,19 +5761,19 @@ pub const Type = extern union {
         }
     }
 
-    pub fn structFieldAlign(ty: Type, index: usize, target: Target) u32 {
+    pub fn structFieldAlign(ty: Type, index: usize, mod: *const Module) u32 {
         switch (ty.tag()) {
             .@"struct" => {
                 const struct_obj = ty.castTag(.@"struct").?.data;
                 assert(struct_obj.layout != .Packed);
-                return struct_obj.fields.values()[index].alignment(target, struct_obj.layout);
+                return struct_obj.fields.values()[index].alignment(mod, struct_obj.layout);
             },
             .@"union", .union_safety_tagged, .union_tagged => {
                 const union_obj = ty.cast(Payload.Union).?.data;
-                return union_obj.fields.values()[index].normalAlignment(target);
+                return union_obj.fields.values()[index].normalAlignment(mod);
             },
-            .tuple => return ty.castTag(.tuple).?.data.types[index].abiAlignment(target),
-            .anon_struct => return ty.castTag(.anon_struct).?.data.types[index].abiAlignment(target),
+            .tuple => return ty.castTag(.tuple).?.data.types[index].abiAlignment(mod),
+            .anon_struct => return ty.castTag(.anon_struct).?.data.types[index].abiAlignment(mod),
             else => unreachable,
         }
     }
@@ -5729,7 +5796,7 @@ pub const Type = extern union {
         }
     }
 
-    pub fn structFieldValueComptime(ty: Type, index: usize) ?Value {
+    pub fn structFieldValueComptime(ty: Type, mod: *const Module, index: usize) ?Value {
         switch (ty.tag()) {
             .@"struct" => {
                 const struct_obj = ty.castTag(.@"struct").?.data;
@@ -5737,14 +5804,14 @@ pub const Type = extern union {
                 if (field.is_comptime) {
                     return field.default_val;
                 } else {
-                    return field.ty.onePossibleValue();
+                    return field.ty.onePossibleValue(mod);
                 }
             },
             .tuple => {
                 const tuple = ty.castTag(.tuple).?.data;
                 const val = tuple.values[index];
                 if (val.tag() == .unreachable_value) {
-                    return tuple.types[index].onePossibleValue();
+                    return tuple.types[index].onePossibleValue(mod);
                 } else {
                     return val;
                 }
@@ -5753,7 +5820,7 @@ pub const Type = extern union {
                 const anon_struct = ty.castTag(.anon_struct).?.data;
                 const val = anon_struct.values[index];
                 if (val.tag() == .unreachable_value) {
-                    return anon_struct.types[index].onePossibleValue();
+                    return anon_struct.types[index].onePossibleValue(mod);
                 } else {
                     return val;
                 }
@@ -5784,7 +5851,7 @@ pub const Type = extern union {
         }
     }
 
-    pub fn packedStructFieldByteOffset(ty: Type, field_index: usize, target: Target) u32 {
+    pub fn packedStructFieldByteOffset(ty: Type, field_index: usize, mod: *const Module) u32 {
         const struct_obj = ty.castTag(.@"struct").?.data;
         assert(struct_obj.layout == .Packed);
         comptime assert(Type.packed_struct_layout_version == 2);
@@ -5793,9 +5860,9 @@ pub const Type = extern union {
         var elem_size_bits: u16 = undefined;
         var running_bits: u16 = 0;
         for (struct_obj.fields.values(), 0..) |f, i| {
-            if (!f.ty.hasRuntimeBits()) continue;
+            if (!f.ty.hasRuntimeBits(mod)) continue;
 
-            const field_bits = @intCast(u16, f.ty.bitSize(target));
+            const field_bits = @intCast(u16, f.ty.bitSize(mod));
             if (i == field_index) {
                 bit_offset = running_bits;
                 elem_size_bits = field_bits;
@@ -5816,7 +5883,7 @@ pub const Type = extern union {
         offset: u64 = 0,
         big_align: u32 = 0,
         struct_obj: *Module.Struct,
-        target: Target,
+        mod: *const Module,
 
         pub fn next(it: *StructOffsetIterator) ?FieldOffset {
             var i = it.field;
@@ -5830,14 +5897,14 @@ pub const Type = extern union {
             const field = it.struct_obj.fields.values()[i];
             it.field += 1;
 
-            if (field.is_comptime or !field.ty.hasRuntimeBits()) {
+            if (field.is_comptime or !field.ty.hasRuntimeBits(it.mod)) {
                 return FieldOffset{ .field = i, .offset = it.offset };
             }
 
-            const field_align = field.alignment(it.target, it.struct_obj.layout);
+            const field_align = field.alignment(it.mod, it.struct_obj.layout);
             it.big_align = @max(it.big_align, field_align);
             const field_offset = std.mem.alignForwardGeneric(u64, it.offset, field_align);
-            it.offset = field_offset + field.ty.abiSize(it.target);
+            it.offset = field_offset + field.ty.abiSize(it.mod);
             return FieldOffset{ .field = i, .offset = field_offset };
         }
     };
@@ -5852,7 +5919,8 @@ pub const Type = extern union {
     }
 
     /// Supports structs and unions.
-    pub fn structFieldOffset(ty: Type, index: usize, target: Target) u64 {
+    pub fn structFieldOffset(ty: Type, index: usize, mod: *const Module) u64 {
+        const target = mod.getTarget();
         switch (ty.tag()) {
             .@"struct" => {
                 const struct_obj = ty.castTag(.@"struct").?.data;
@@ -5881,11 +5949,11 @@ pub const Type = extern union {
                         continue;
                     }
 
-                    const field_align = field_ty.abiAlignment(target);
+                    const field_align = field_ty.abiAlignment(mod);
                     big_align = @max(big_align, field_align);
                     offset = std.mem.alignForwardGeneric(u64, offset, field_align);
                     if (i == index) return offset;
-                    offset += field_ty.abiSize(target);
+                    offset += field_ty.abiSize(mod);
                 }
                 offset = std.mem.alignForwardGeneric(u64, offset, @max(big_align, 1));
                 return offset;
@@ -6069,10 +6137,6 @@ pub const Type = extern union {
         manyptr_u8,
         manyptr_const_u8,
         manyptr_const_u8_sentinel_0,
-        fn_noreturn_no_args,
-        fn_void_no_args,
-        fn_naked_noreturn_no_args,
-        fn_ccc_void_no_args,
         single_const_pointer_to_comptime_int,
         const_slice_u8,
         const_slice_u8_sentinel_0,
@@ -6110,8 +6174,6 @@ pub const Type = extern union {
         c_mut_pointer,
         const_slice,
         mut_slice,
-        int_signed,
-        int_unsigned,
         function,
         optional,
         optional_single_mut_pointer,
@@ -6180,10 +6242,6 @@ pub const Type = extern union {
                 .enum_literal,
                 .null,
                 .undefined,
-                .fn_noreturn_no_args,
-                .fn_void_no_args,
-                .fn_naked_noreturn_no_args,
-                .fn_ccc_void_no_args,
                 .single_const_pointer_to_comptime_int,
                 .anyerror_void_error_union,
                 .const_slice_u8,
@@ -6229,10 +6287,6 @@ pub const Type = extern union {
                 .anyframe_T,
                 => Payload.ElemType,
 
-                .int_signed,
-                .int_unsigned,
-                => Payload.Bits,
-
                 .error_set => Payload.ErrorSet,
                 .error_set_inferred => Payload.ErrorSetInferred,
                 .error_set_merged => Payload.ErrorSetMerged,
@@ -6257,7 +6311,10 @@ pub const Type = extern union {
 
         pub fn init(comptime t: Tag) file_struct.Type {
             comptime std.debug.assert(@enumToInt(t) < Tag.no_payload_count);
-            return .{ .tag_if_small_enough = t };
+            return file_struct.Type{
+                .ip_index = .none,
+                .legacy = .{ .tag_if_small_enough = t },
+            };
         }
 
         pub fn create(comptime t: Tag, ally: Allocator, data: Data(t)) error{OutOfMemory}!file_struct.Type {
@@ -6266,7 +6323,10 @@ pub const Type = extern union {
                 .base = .{ .tag = t },
                 .data = data,
             };
-            return file_struct.Type{ .ptr_otherwise = &p.base };
+            return file_struct.Type{
+                .ip_index = .none,
+                .legacy = .{ .ptr_otherwise = &p.base },
+            };
         }
 
         pub fn Data(comptime t: Tag) type {
@@ -6447,10 +6507,9 @@ pub const Type = extern union {
                     runtime = std.math.maxInt(u32) - 1,
                     _,
                 };
-
-                pub fn alignment(data: Data, target: Target) u32 {
+                pub fn alignment(data: Data, mod: *const Module) u32 {
                     if (data.@"align" != 0) return data.@"align";
-                    return abiAlignment(data.pointee_type, target);
+                    return abiAlignment(data.pointee_type, mod);
                 }
             };
         };
@@ -6562,12 +6621,11 @@ pub const Type = extern union {
     pub const @"anyerror" = initTag(.anyerror);
     pub const @"anyopaque" = initTag(.anyopaque);
     pub const @"null" = initTag(.null);
+    pub const @"noreturn" = initTag(.noreturn);
 
     pub const err_int = Type.u16;
 
     pub fn ptr(arena: Allocator, mod: *Module, data: Payload.Pointer.Data) !Type {
-        const target = mod.getTarget();
-
         var d = data;
 
         if (d.size == .C) {
@@ -6580,7 +6638,7 @@ pub const Type = extern union {
         // this ptr() function.
         if (d.@"align" != 0) canonicalize: {
             if (!d.pointee_type.layoutIsResolved()) break :canonicalize;
-            if (d.@"align" == d.pointee_type.abiAlignment(target)) {
+            if (d.@"align" == d.pointee_type.abiAlignment(mod)) {
                 d.@"align" = 0;
             }
         }
@@ -6590,7 +6648,7 @@ pub const Type = extern union {
         // needs to be resolved before calling this ptr() function.
         if (d.host_size != 0) {
             assert(d.bit_offset < d.host_size * 8);
-            if (d.host_size * 8 == d.pointee_type.bitSize(target)) {
+            if (d.host_size * 8 == d.pointee_type.bitSize(mod)) {
                 assert(d.bit_offset == 0);
                 d.host_size = 0;
             }
@@ -6701,7 +6759,7 @@ pub const Type = extern union {
         payload: Type,
         mod: *Module,
     ) Allocator.Error!Type {
-        assert(error_set.zigTypeTag() == .ErrorSet);
+        assert(error_set.zigTypeTag(mod) == .ErrorSet);
         if (error_set.eql(Type.anyerror, mod) and
             payload.eql(Type.void, mod))
         {
